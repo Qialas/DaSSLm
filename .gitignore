@@ -1,0 +1,34 @@
+.DS_Store
+
+# Local config
+server/config/config.yaml
+server/config/install.lock
+
+# Node dependencies
+admin-web/node_modules/
+
+# Frontend build output
+admin-web/dist/
+admin-web/src/.umi/
+admin-web/src/.umi-production/
+
+# Server release output
+server/dist/
+/dist/
+
+# Logs and runtime files
+*.log
+*.pid
+
+# Editor and OS files
+.idea/
+.vscode/
+
+# Local frontend environment and browser test artifacts
+admin-web/.env.local
+admin-web/.env.*.local
+admin-web/test-results/
+admin-web/playwright-report/
+
+# Local backup archives
+/*.tgz
