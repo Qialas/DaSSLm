@@ -12,7 +12,7 @@ cd "${SERVER_DIR}"
 rm -rf "${PACKAGE_DIR}"
 mkdir -p "${PACKAGE_DIR}/config"
 
-GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o "${PACKAGE_DIR}/dasslm-server" ./cmd/dasslm-server
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o "${PACKAGE_DIR}/dasslm-server" ./cmd/dasslm-server
 cp "${SERVER_DIR}/config/config.example.yaml" "${PACKAGE_DIR}/config/config.yaml"
 cp "${SERVER_DIR}/README.md" "${PACKAGE_DIR}/README.md"
 
