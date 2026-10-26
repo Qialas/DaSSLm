@@ -51,7 +51,7 @@ func (h *AuthHandler) Login(c *gin.Context) {
 		return
 	}
 
-	token, expiresAt, err := auth.GenerateToken(h.cfg.JWT.Secret, h.cfg.JWT.ExpireHours, user.ID, user.Username, user.Role)
+	token, expiresAt, err := auth.GenerateToken(h.cfg.JWT.Secret, h.cfg.JWT.ExpireHours, user.ID, user.Username, user.Role, user.TokenVersion)
 	if err != nil {
 		core.Fail(c, http.StatusInternalServerError, "生成登录凭证失败")
 		return

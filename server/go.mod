@@ -1,6 +1,8 @@
 module dasslm/server
 
-go 1.24.0
+go 1.26.0
+
+toolchain go1.26.10
 
 require (
 	github.com/alibabacloud-go/alidns-20150109/v5 v5.4.1
@@ -8,8 +10,8 @@ require (
 	github.com/alibabacloud-go/tea v1.5.0
 	github.com/gin-contrib/cors v1.7.2
 	github.com/gin-gonic/gin v1.10.0
-	github.com/golang-jwt/jwt/v5 v5.2.1
-	golang.org/x/crypto v0.46.0
+	github.com/golang-jwt/jwt/v5 v5.3.1
+	golang.org/x/crypto v0.58.0
 	gopkg.in/yaml.v3 v3.0.1
 	gorm.io/driver/mysql v1.5.7
 	gorm.io/driver/sqlite v1.5.7
@@ -54,9 +56,9 @@ require (
 	github.com/twitchyliquid64/golang-asm v0.15.1 // indirect
 	github.com/ugorji/go/codec v1.2.12 // indirect
 	golang.org/x/arch v0.8.0 // indirect
-	golang.org/x/net v0.48.0 // indirect
-	golang.org/x/sys v0.39.0 // indirect
-	golang.org/x/text v0.32.0 // indirect
+	golang.org/x/net v0.61.0
+	golang.org/x/sys v0.49.0 // indirect
+	golang.org/x/text v0.43.0 // indirect
 	google.golang.org/protobuf v1.34.1 // indirect
 	gopkg.in/ini.v1 v1.67.0 // indirect
 )

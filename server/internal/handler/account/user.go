@@ -115,12 +115,14 @@ func (h *UserHandler) Update(c *gin.Context) {
 		core.Fail(c, http.StatusBadRequest, "用户名已存在")
 		return
 	}
+	previousRole, previousStatus := user.Role, user.Status
 	user.Username = username
 	user.Nickname = req.Nickname
 	user.Email = req.Email
 	user.Phone = req.Phone
 	user.Role = defaultString(req.Role, user.Role)
 	user.Status = defaultString(req.Status, user.Status)
+	revoke := user.Role != previousRole || user.Status != previousStatus
 	if req.Password != "" {
 		hash, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
 		if err != nil {
@@ -128,6 +130,11 @@ func (h *UserHandler) Update(c *gin.Context) {
 			return
 		}
 		user.PasswordHash = string(hash)
+		revoke = true
+	}
+	// 改密码、改角色、启用/停用后，该用户已登录的所有设备需重新登录
+	if revoke {
+		user.TokenVersion++
 	}
 	if err := h.db.Save(&user).Error; err != nil {
 		core.Fail(c, http.StatusInternalServerError, "保存用户失败")

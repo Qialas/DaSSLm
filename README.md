@@ -75,7 +75,7 @@ cd server
 cp config/config.example.yaml config/config.yaml
 ```
 
-编辑 `server/config/config.yaml`，填写 MySQL 连接信息，并在生产环境修改 `jwt.secret`。
+编辑 `server/config/config.yaml`，填写 MySQL 连接信息。`jwt.secret` 保持留空即可，首次启动会自动生成随机密钥并写回配置文件，之后重启继续复用；如需自定义，填写 32 位以上的随机字符串。
 
 ### 3. 启动服务端
 
@@ -176,7 +176,7 @@ database:
   loc: Local
 
 jwt:
-  secret: "please-change-this-secret"
+  secret: "" # 留空时首次启动自动生成随机密钥并写回本文件；填写则直接使用
   expireHours: 24
 ```
 
@@ -184,9 +184,17 @@ jwt:
 
 ### 未发布
 
-- 管理端业务页面全部改为 Art Design Pro（Vue 3 + Element Plus）原生实现，移除 React、Ant Design 与 Pro Components 依赖。
+- 安全：`jwt.secret` 默认留空，首次启动自动生成随机密钥并写回配置文件；仍使用旧版公开默认值 `please-change-this-secret` 的部署会自动替换（所有用户需重新登录一次）。
+- 安全：登录状态以数据库为准，用户被删除、停用，或修改密码、变更角色后，已签发的登录凭证立即失效；登录凭证仅接受 HS256 签名。
+- 依赖：升级 `golang-jwt/jwt` 至 v5.3.1、`golang.org/x/net`、`golang.org/x/crypto` 等至最新版本，Go 工具链固定为 1.26.10，`govulncheck` 无可达漏洞；升级前端 Vite 修复开发服务器安全问题。
 
-### v1.3.0
+### v0.0.1
+
+- 管理端业务页面全部改为 Art Design Pro（Vue 3 + Element Plus）原生实现，移除 React、Ant Design 与 Pro Components 依赖。
+- 宝塔面板部署账号自动忽略面板 HTTPS 自签名证书。
+- 项目更名为 DaSSLm，旧版 `qdl_*` 数据表启动时自动重命名为 `dasslm_*`。
+
+### v1.3.0（旧版 DnsaSSL_Mgr）
 
 - 更新自动任务，支持按证书选择多个部署目标并自动部署。
 - 优化代码结构，拆分 DNS、SSL、部署账号和 Handler 模块，便于后续维护。

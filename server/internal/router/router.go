@@ -38,7 +38,7 @@ func New(cfg *config.Config, db *gorm.DB) *gin.Engine {
 	api.POST("/auth/login", authHandler.Login)
 
 	authed := api.Group("")
-	authed.Use(middleware.Auth(cfg.JWT.Secret))
+	authed.Use(middleware.Auth(db, cfg.JWT.Secret))
 	authed.Use(middleware.OperationLogger(db))
 	authed.GET("/auth/me", authHandler.Me)
 	authed.GET("/dashboard/overview", accounthandler.NewDashboardHandler(db).Overview)

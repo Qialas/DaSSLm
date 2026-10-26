@@ -14,5 +14,5 @@ database:
   loc: Local
 
 jwt:
-  secret: "please-change-this-secret"
+  secret: "" # 留空时首次启动自动生成随机密钥并写回本文件；填写则直接使用
   expireHours: 24

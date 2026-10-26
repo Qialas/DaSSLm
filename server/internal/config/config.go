@@ -81,5 +81,8 @@ func Load() (*Config, error) {
 	if cfg.JWT.ExpireHours == 0 {
 		cfg.JWT.ExpireHours = 24
 	}
+	if err := ensureJWTSecret(cfg, path, data); err != nil {
+		return nil, err
+	}
 	return cfg, nil
 }
