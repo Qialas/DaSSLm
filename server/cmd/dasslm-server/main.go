@@ -4,10 +4,21 @@ import (
 	"dasslm/server/internal/config"
 	"dasslm/server/internal/database"
 	"dasslm/server/internal/router"
+	"fmt"
 	"log"
+	"os"
 )
 
+// version 当前版本号，发布时可通过 -ldflags "-X main.version=x.y.z" 覆盖
+var version = "0.0.1"
+
 func main() {
+	if len(os.Args) > 1 && (os.Args[1] == "-v" || os.Args[1] == "--version" || os.Args[1] == "version") {
+		fmt.Println("dasslm-server", version)
+		return
+	}
+	log.Printf("DaSSLm v%s starting", version)
+
 	cfg, err := config.Load()
 	if err != nil {
 		log.Fatalf("load config failed: %v", err)

@@ -5,14 +5,18 @@ import AutoImport from 'unplugin-auto-import/vite'
 import Components from 'unplugin-vue-components/vite'
 import ElementPlus from 'unplugin-element-plus/vite'
 import { ElementPlusResolver } from 'unplugin-vue-components/resolvers'
+import { readFileSync } from 'node:fs'
 import { fileURLToPath, URL } from 'node:url'
+
+// 版本号统一以 package.json 为准
+const { version } = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8')) as { version: string }
 
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), '')
   const resolve = (path: string) => fileURLToPath(new URL(path, import.meta.url))
   return {
     envPrefix: ['VITE_', 'UMI_APP_'],
-    define: { __APP_VERSION__: JSON.stringify('1.3.0') },
+    define: { __APP_VERSION__: JSON.stringify(version) },
     base: '/',
     plugins: [
       vue(),
