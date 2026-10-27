@@ -45,7 +45,7 @@ DaSSLm 面向需要统一管理域名解析、SSL 证书申请、证书资产和
 
 #### 2.下载release包
 
-Linux服务器可以直接在 [release](https://github.com/Qialas/DaSSLm/releases) 中下载打包好的dasslm-server-linux-amd64.tar.gz，上传到对应目录中并解压
+Linux服务器可以直接在 [release](https://github.com/Qialas/DaSSLm/releases) 中下载打包好的 `dasslm-server-linux-amd64-v版本号.tar.gz`（ARM 服务器下载 `arm64` 版本），上传到对应目录中并解压
 
 #### 3.创建Go项目
 
@@ -112,12 +112,12 @@ npm run dev
 
 ## Linux 打包部署
 
-项目提供一键 Linux amd64 打包脚本。脚本会先构建 `admin-web`，再同步到 `server/internal/web/dist` 并嵌入 Go 二进制。
+项目提供一键 Linux 打包脚本。脚本会先构建 `admin-web`，再同步到 `server/internal/web/dist` 并嵌入 Go 二进制。
 
 ```bash
 cd server
-chmod +x scripts/package-linux.sh
-./scripts/package-linux.sh
+./scripts/package-linux.sh                          # 默认 amd64
+GOARCH=arm64 VERSION=0.0.3 ./scripts/package-linux.sh  # 指定架构，并把版本号写入程序和包名
 ```
 
 打包产物：
@@ -138,6 +138,21 @@ dist/dasslm-server-linux-amd64.tar.gz
 ```text
 http://服务器IP:8080/
 ```
+
+### 自动发布（GitHub Actions）
+
+推送到 `main` 或提交 Pull Request 时，CI 会自动执行服务端测试、`govulncheck`、管理端构建和 `npm audit`。
+
+发布新版本的步骤：
+
+1. 修改版本号：`admin-web/package.json` 的 `version` 和 `server/cmd/dasslm-server/main.go` 的 `version`（两者必须一致）
+2. 在本文「更新说明」中新增 `### v0.0.3` 一节，写明本版本改动（会作为 Release 说明）
+3. 提交并推送到 `main`
+4. 触发发布，任选一种：
+   - 推送 tag：`git tag v0.0.3 && git push origin v0.0.3`
+   - 在 GitHub 仓库的 Actions → Release → Run workflow，填写版本号 `0.0.3`
+
+工作流会校验版本号、跑测试、打包 amd64 / arm64 两个发布包并生成 SHA256，自动创建 Release；Release 已存在时会更新附件和说明。
 
 ## 常用命令
 
