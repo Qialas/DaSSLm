@@ -182,11 +182,12 @@ jwt:
 
 ## 更新说明
 
-### 未发布
+### v0.0.2
 
 - 安全：`jwt.secret` 默认留空，首次启动自动生成随机密钥并写回配置文件；仍使用旧版公开默认值 `please-change-this-secret` 的部署会自动替换（所有用户需重新登录一次）。
 - 安全：登录状态以数据库为准，用户被删除、停用，或修改密码、变更角色后，已签发的登录凭证立即失效；登录凭证仅接受 HS256 签名。
 - 依赖：升级 `golang-jwt/jwt` 至 v5.3.1、`golang.org/x/net`、`golang.org/x/crypto` 等至最新版本，Go 工具链固定为 1.26.10，`govulncheck` 无可达漏洞。
+- 依赖：前端升级 Vite 7.3.7、follow-redirects、source-map-js，`npm audit` 无漏洞。
 
 ### v0.0.1
 
