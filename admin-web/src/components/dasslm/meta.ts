@@ -132,6 +132,16 @@ export function isBTPanelProvider(provider?: string) {
   return provider === 'btpanel' || provider === 'baota'
 }
 
+/** 宝塔部署类型：网站走面板站点接口；Docker 网站没有列表接口，需手动填写域名 */
+export const btDeployTypes = [
+  { label: '网站', value: 'site' },
+  { label: 'Docker 网站', value: 'docker' }
+]
+
+export const btDeployTypeNames: Record<string, string> = Object.fromEntries(
+  btDeployTypes.map((item) => [item.value, item.label])
+)
+
 export const tencentDeployProducts = [
   { label: '仅上传到证书管理', value: 'ssl' },
   { label: 'CDN', value: 'cdn' },

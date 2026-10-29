@@ -66,6 +66,24 @@ func (info SystemTotal) Valid() bool {
 	return info.MemTotal > 0 || info.CPUNum > 0 || strings.TrimSpace(info.Version) != "" || strings.TrimSpace(info.System) != ""
 }
 
+// 宝塔部署目标类型，存放在部署目标的 ProductType 中；为空表示普通网站。
+const (
+	BTPanelTargetSite   = ""
+	BTPanelTargetDocker = "docker"
+)
+
+// NormalizeBTPanelTargetType 校验并规范宝塔部署目标类型。
+func NormalizeBTPanelTargetType(value string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "", "site":
+		return BTPanelTargetSite, nil
+	case BTPanelTargetDocker:
+		return BTPanelTargetDocker, nil
+	default:
+		return "", fmt.Errorf("不支持的宝塔部署类型：%s", value)
+	}
+}
+
 func IsBTPanelProvider(provider string) bool {
 	return strings.EqualFold(provider, "btpanel") || strings.EqualFold(provider, "baota")
 }
@@ -180,13 +198,24 @@ func DeployCertificateToTarget(ctx context.Context, account model.DeployAccount,
 	if siteName == "" {
 		return nil, fmt.Errorf("宝塔站点名称不能为空")
 	}
+	targetType, err := NormalizeBTPanelTargetType(target.ProductType)
+	if err != nil {
+		return nil, err
+	}
+	path := "/site"
 	form := url.Values{}
-	form.Set("action", "SetSSL")
-	form.Set("siteName", siteName)
+	if targetType == BTPanelTargetDocker {
+		// Docker 网站使用 Docker 模块自己的证书接口（官方文档未收录，参考 dnsmgr 的实现）
+		path = "/mod/docker/com/set_ssl"
+		form.Set("site_name", siteName)
+	} else {
+		form.Set("action", "SetSSL")
+		form.Set("siteName", siteName)
+	}
 	form.Set("key", strings.TrimSpace(keyPEM))
 	form.Set("csr", strings.TrimSpace(certPEM))
 	var out map[string]any
-	trace, err := btPanelRequest(ctx, account, client, "/site", form, &out, "request_token", "key", "csr")
+	trace, err := btPanelRequest(ctx, account, client, path, form, &out, "request_token", "key", "csr")
 	if err != nil {
 		return trace, err
 	}

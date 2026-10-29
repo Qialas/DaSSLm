@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"dasslm/server/internal/model"
+	deployservice "dasslm/server/internal/service/deploy"
 	"dasslm/server/internal/service/notification"
 
 	"github.com/gin-gonic/gin"
@@ -217,7 +218,15 @@ func (h *AutoTaskHandler) buildAutoDeployTask(req autoTaskRequest, previous *mod
 			return model.AutoTask{}, nil, fmt.Errorf("部署账号已停用：%s", deployAccount.Name)
 		}
 		siteName := firstNonEmpty(item.SiteName, cert.CommonName)
-		key := fmt.Sprintf("%d:%s:%s:%s", deployAccount.ID, strings.TrimSpace(item.ProductType), firstNonEmpty(item.ResourceID, siteName), siteName)
+		productType := strings.TrimSpace(item.ProductType)
+		if deployservice.IsBTPanelProvider(deployAccount.Provider) {
+			normalized, err := deployservice.NormalizeBTPanelTargetType(productType)
+			if err != nil {
+				return model.AutoTask{}, nil, err
+			}
+			productType = normalized
+		}
+		key := fmt.Sprintf("%d:%s:%s:%s", deployAccount.ID, productType, firstNonEmpty(item.ResourceID, siteName), siteName)
 		if _, ok := seen[key]; ok {
 			return model.AutoTask{}, nil, fmt.Errorf("部署目标重复：%s", siteName)
 		}
@@ -225,7 +234,7 @@ func (h *AutoTaskHandler) buildAutoDeployTask(req autoTaskRequest, previous *mod
 		targets = append(targets, model.AutoTaskTarget{
 			DeployAccountID: deployAccount.ID,
 			SiteName:        siteName,
-			ProductType:     strings.TrimSpace(item.ProductType),
+			ProductType:     productType,
 			Region:          strings.TrimSpace(item.Region),
 			ResourceID:      strings.TrimSpace(item.ResourceID),
 			ResourceName:    strings.TrimSpace(item.ResourceName),

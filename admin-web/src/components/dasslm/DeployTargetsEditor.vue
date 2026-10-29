@@ -7,6 +7,9 @@
         <div class="targets-panel__info">
           <strong>{{ accountMap[target.deployAccountId]?.name || `账号#${target.deployAccountId}` }}</strong>
           <span>{{ deployProviderLabel(accountMap[target.deployAccountId]?.provider) }} / {{ target.siteName || '-' }}</span>
+          <span v-if="target.productType === 'docker' && isBTPanelProvider(accountMap[target.deployAccountId]?.provider)">
+            {{ btDeployTypeNames.docker }}
+          </span>
           <span v-if="accountMap[target.deployAccountId]?.provider === 'tencentcloud'">
             {{ tencentDeployProductNames[target.productType || 'ssl'] || target.productType || '腾讯云' }} /
             {{ target.resourceId || target.siteName || '-' }}
@@ -38,6 +41,13 @@
         <div class="targets-picker__label">选择部署账号</div>
         <DeployAccountPicker v-model="draft.deployAccountId" :accounts="deployAccounts" @change="onAccountChange" />
 
+        <template v-if="isBTPanel">
+          <div class="targets-picker__label">部署类型</div>
+          <ElRadioGroup v-model="draft.btType" @change="onBTTypeChange">
+            <ElRadioButton v-for="item in btDeployTypes" :key="item.value" :value="item.value">{{ item.label }}</ElRadioButton>
+          </ElRadioGroup>
+        </template>
+
         <div class="targets-picker__label">
           {{ siteLabel }}
           <ElTooltip :content="siteHelp" placement="top">
@@ -63,7 +73,7 @@
           :remote-method="searchSites"
           :loading="siteLoading"
           :placeholder="defaultSiteName || siteLabel"
-          :no-data-text="isBTPanel ? '未找到站点，可直接手动输入' : '可直接手动输入'"
+          :no-data-text="siteNoDataText"
           @visible-change="onSiteDropdown"
           @change="normalizeDraftSites"
         >
@@ -91,6 +101,8 @@
   import DeployAccountPicker from './DeployAccountPicker.vue'
   import TableAction from './TableAction.vue'
   import {
+    btDeployTypeNames,
+    btDeployTypes,
     deployProviderLabel,
     enabledStatusOptions,
     isBTPanelProvider,
@@ -121,16 +133,24 @@
   const draftAccount = computed(() => (draft.deployAccountId ? accountMap.value[draft.deployAccountId] : undefined))
   const isBTPanel = computed(() => isBTPanelProvider(draftAccount.value?.provider))
   const isTencent = computed(() => draftAccount.value?.provider === 'tencentcloud')
-  const siteLabel = computed(() => (isBTPanel.value ? '站点名称' : '站点/服务名称'))
-  const siteHelp = computed(() =>
-    isTencent.value
-      ? '选择腾讯云产品并填写对应资源ID、域名或实例标识。'
-      : '宝塔账号可从站点列表选择；其他部署服务可直接输入服务名称或目标标识。'
-  )
+  const isBTDocker = computed(() => isBTPanel.value && draft.btType === 'docker')
+  const siteLabel = computed(() => {
+    if (isBTDocker.value) return 'Docker 网站域名'
+    return isBTPanel.value ? '站点名称' : '站点/服务名称'
+  })
+  const siteHelp = computed(() => {
+    if (isTencent.value) return '选择腾讯云产品并填写对应资源ID、域名或实例标识。'
+    if (isBTDocker.value) return '宝塔面板没有提供 Docker 网站列表接口，请手动输入 Docker 网站的域名（即面板中显示的网站名），可输入多个。'
+    return '宝塔账号可从站点列表选择；其他部署服务可直接输入服务名称或目标标识。'
+  })
+  const siteNoDataText = computed(() => {
+    if (isBTDocker.value) return '请手动输入 Docker 网站域名后回车'
+    return isBTPanel.value ? '未找到站点，可直接手动输入' : '可直接手动输入'
+  })
 
   function resetDraft() {
     Object.keys(draft).forEach((key) => delete draft[key])
-    Object.assign(draft, { status: 'enabled', siteNames: [] })
+    Object.assign(draft, { status: 'enabled', siteNames: [], btType: 'site' })
     editingIndex.value = null
     siteOptions.value = []
   }
@@ -138,12 +158,17 @@
   function openPicker(target?: Row, index?: number) {
     resetDraft()
     if (target) {
-      Object.assign(draft, { ...target, siteNames: normalizeSiteNames(target.siteName) })
+      Object.assign(draft, {
+        ...target,
+        siteNames: normalizeSiteNames(target.siteName),
+        btType: target.productType === 'docker' ? 'docker' : 'site'
+      })
       editingIndex.value = index ?? null
     } else {
       Object.assign(draft, {
         deployAccountId: undefined,
         siteNames: props.defaultSiteName ? [props.defaultSiteName] : [],
+        btType: 'site',
         status: 'enabled',
         remark: ''
       })
@@ -158,10 +183,16 @@
     searchSites('')
   }
 
+  function onBTTypeChange() {
+    siteOptions.value = []
+    searchSites('')
+  }
+
   let siteSeq = 0
   async function searchSites(keyword: string) {
     const account = draftAccount.value
-    if (!account || !isBTPanelProvider(account.provider)) {
+    // Docker 网站没有列表接口，只能手动输入
+    if (!account || !isBTPanelProvider(account.provider) || isBTDocker.value) {
       siteOptions.value = []
       return
     }
@@ -200,10 +231,11 @@
       return
     }
     const tencent = isTencent.value
+    const productType = tencent ? draft.productType || 'ssl' : isBTDocker.value ? 'docker' : ''
     const nextTargets = siteNames.map((siteName) => ({
       deployAccountId: Number(draft.deployAccountId),
       siteName,
-      productType: tencent ? draft.productType || 'ssl' : '',
+      productType,
       region: tencent ? draft.region || '' : '',
       resourceId: tencent ? draft.resourceId || siteName : '',
       resourceName: tencent ? draft.resourceName || '' : '',
@@ -212,9 +244,10 @@
       remark: draft.remark || ''
     }))
     const rows = targets.value.filter((_, index) => index !== editingIndex.value)
-    const existing = new Set(rows.map((item) => `${Number(item.deployAccountId)}:${item.siteName}`))
+    const targetKey = (item: Row) => `${Number(item.deployAccountId)}:${item.productType || ''}:${item.siteName}`
+    const existing = new Set(rows.map(targetKey))
     const unique = nextTargets.filter((item) => {
-      const key = `${item.deployAccountId}:${item.siteName}`
+      const key = targetKey(item)
       if (existing.has(key)) return false
       existing.add(key)
       return true
