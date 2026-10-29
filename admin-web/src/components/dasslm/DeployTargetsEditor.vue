@@ -1,44 +1,65 @@
 <!-- 自动部署任务的部署目标编辑：目标列表 + 添加/编辑目标的二级抽屉 -->
 <template>
   <div class="targets-panel">
-    <div class="targets-panel__head">已添加 {{ targets.length }} 个部署服务</div>
     <div v-if="targets.length" class="targets-panel__list">
-      <div v-for="(target, index) in targets" :key="`${target.deployAccountId}-${target.siteName}-${index}`" class="targets-panel__item">
-        <div class="targets-panel__info">
-          <strong>{{ accountMap[target.deployAccountId]?.name || `账号#${target.deployAccountId}` }}</strong>
-          <span>{{ deployProviderLabel(accountMap[target.deployAccountId]?.provider) }} / {{ target.siteName || '-' }}</span>
-          <span v-if="target.productType === 'docker' && isBTPanelProvider(accountMap[target.deployAccountId]?.provider)">
-            {{ btDeployTypeNames.docker }}
-          </span>
-          <span v-if="accountMap[target.deployAccountId]?.provider === 'tencentcloud'">
-            {{ tencentDeployProductNames[target.productType || 'ssl'] || target.productType || '腾讯云' }} /
-            {{ target.resourceId || target.siteName || '-' }}
-          </span>
+      <div
+        v-for="(target, index) in targets"
+        :key="`${target.deployAccountId}-${target.productType || ''}-${target.siteName}-${index}`"
+        class="target-row"
+        :class="{ 'is-disabled': (target.status || 'enabled') !== 'enabled' }"
+      >
+        <ProviderIcon :provider="brandProvider(accountMap[target.deployAccountId]?.provider)" size="md" boxed />
+        <div class="target-row__main">
+          <div class="target-row__title">
+            <span class="truncate" :title="target.siteName">{{ target.siteName || '-' }}</span>
+            <ElTag v-if="targetTypeLabel(target)" size="small" effect="plain" disable-transitions>{{ targetTypeLabel(target) }}</ElTag>
+            <ElTag v-if="(target.status || 'enabled') !== 'enabled'" size="small" type="info" disable-transitions>停用</ElTag>
+          </div>
+          <div class="target-row__sub">
+            <span class="truncate">
+              {{ accountMap[target.deployAccountId]?.name || `账号#${target.deployAccountId}` }} ·
+              {{ deployProviderLabel(accountMap[target.deployAccountId]?.provider) }}
+              <template v-if="isTencentTarget(target) && target.resourceId && target.resourceId !== target.siteName">
+                · {{ target.resourceId }}
+              </template>
+              <template v-if="target.remark"> · {{ target.remark }}</template>
+            </span>
+          </div>
         </div>
-        <div class="targets-panel__actions">
-          <ElTag size="small" :type="(target.status || 'enabled') === 'enabled' ? 'success' : 'info'" disable-transitions>
-            {{ (target.status || 'enabled') === 'enabled' ? '启用' : '停用' }}
-          </ElTag>
-          <TableAction icon="ri:pencil-line" @click="openPicker(target, index)">编辑</TableAction>
-          <TableAction icon="ri:delete-bin-5-line" type="danger" @click="removeTarget(index)">删除</TableAction>
+        <div class="target-row__actions">
+          <ElTooltip content="编辑" placement="top">
+            <ElButton text circle size="small" aria-label="编辑部署目标" @click="openPicker(target, index)">
+              <ArtSvgIcon icon="ri:pencil-line" />
+            </ElButton>
+          </ElTooltip>
+          <ElPopconfirm title="确认移除这个部署目标？" @confirm="removeTarget(index)">
+            <template #reference>
+              <ElButton text circle size="small" type="danger" aria-label="删除部署目标">
+                <ArtSvgIcon icon="ri:delete-bin-5-line" />
+              </ElButton>
+            </template>
+          </ElPopconfirm>
         </div>
       </div>
     </div>
-    <ElEmpty v-else description="还没有添加部署服务" :image-size="56" />
+    <div v-else class="targets-panel__empty">
+      <ArtSvgIcon icon="ri:server-line" class="targets-panel__empty-icon" />
+      <span>还没有部署目标，添加后证书更新时会自动部署过去</span>
+    </div>
     <ElButton class="targets-panel__add" plain @click="openPicker()">
-      <ArtSvgIcon icon="ri:add-line" class="mr-1" />添加部署服务
+      <ArtSvgIcon icon="ri:add-line" class="mr-1" />添加部署目标
     </ElButton>
 
     <ElDrawer
       v-model="pickerOpen"
-      :title="editingIndex === null ? '添加部署服务' : '编辑部署服务'"
+      :title="editingIndex === null ? '添加部署目标' : '编辑部署目标'"
       :size="pickerSize"
       append-to-body
       destroy-on-close
       @closed="resetDraft"
     >
       <div class="targets-picker">
-        <div class="targets-picker__label">选择部署账号</div>
+        <div class="targets-picker__label">部署账号</div>
         <DeployAccountPicker v-model="draft.deployAccountId" :accounts="deployAccounts" @change="onAccountChange" />
 
         <template v-if="isBTPanel">
@@ -55,11 +76,15 @@
           </ElTooltip>
         </div>
         <template v-if="isTencent">
+          <div class="targets-picker__sublabel">部署到的腾讯云产品</div>
           <ElSelect v-model="draft.productType" class="w-full">
             <ElOption v-for="item in tencentDeployProducts" :key="item.value" :label="item.label" :value="item.value" />
           </ElSelect>
-          <ElInput v-model="draft.resourceId" placeholder="资源ID / 域名 / 实例标识" />
-          <ElInput v-model="draft.region" placeholder="地域，可选，如 ap-guangzhou" />
+          <div class="targets-picker__row">
+            <ElInput v-model="draft.resourceId" placeholder="资源ID / 域名 / 实例标识" />
+            <ElInput v-model="draft.region" placeholder="地域（可选），如 ap-guangzhou" />
+          </div>
+          <div class="targets-picker__sublabel">站点/服务名称</div>
         </template>
         <ElSelect
           v-model="draft.siteNames"
@@ -82,14 +107,18 @@
             <span v-if="site.remark" class="targets-picker__site-remark">{{ site.remark }}</span>
           </ElOption>
         </ElSelect>
-        <ElSelect v-model="draft.status" class="w-full">
-          <ElOption v-for="item in enabledStatusOptions" :key="item.value" :label="item.label" :value="item.value" />
-        </ElSelect>
-        <ElInput v-model="draft.remark" type="textarea" :autosize="{ minRows: 3, maxRows: 6 }" placeholder="备注" />
+        <div class="targets-picker__hint">{{ siteHint }}</div>
+
+        <div class="targets-picker__label targets-picker__label--inline">
+          <span>启用此目标</span>
+          <ElSwitch v-model="draft.status" active-value="enabled" inactive-value="disabled" />
+        </div>
+        <div class="targets-picker__label">备注</div>
+        <ElInput v-model="draft.remark" type="textarea" :autosize="{ minRows: 2, maxRows: 5 }" placeholder="可选" />
       </div>
       <template #footer>
         <ElButton @click="pickerOpen = false">返回</ElButton>
-        <ElButton type="primary" @click="saveDraft">添加到任务</ElButton>
+        <ElButton type="primary" @click="saveDraft">{{ editingIndex === null ? '添加' : '保存' }}</ElButton>
       </template>
     </ElDrawer>
   </div>
@@ -99,12 +128,11 @@
   import { ElMessage } from 'element-plus'
   import { listDeployAccountSites, type Row } from '@/api/dasslm'
   import DeployAccountPicker from './DeployAccountPicker.vue'
-  import TableAction from './TableAction.vue'
+  import ProviderIcon from './ProviderIcon.vue'
   import {
     btDeployTypeNames,
     btDeployTypes,
     deployProviderLabel,
-    enabledStatusOptions,
     isBTPanelProvider,
     normalizeSiteNames,
     tencentDeployProductNames,
@@ -142,6 +170,11 @@
     if (isTencent.value) return '选择腾讯云产品并填写对应资源ID、域名或实例标识。'
     if (isBTDocker.value) return '宝塔面板没有提供 Docker 网站列表接口，请手动输入 Docker 网站的域名（即面板中显示的网站名），可输入多个。'
     return '宝塔账号可从站点列表选择；其他部署服务可直接输入服务名称或目标标识。'
+  })
+  const siteHint = computed(() => {
+    if (isBTDocker.value) return '宝塔面板不提供 Docker 网站列表，输入域名后按回车，可添加多个。'
+    if (isBTPanel.value) return '可从宝塔站点列表中选择，也可直接输入站点名后按回车，可添加多个。'
+    return '输入后按回车，可添加多个。'
   })
   const siteNoDataText = computed(() => {
     if (isBTDocker.value) return '请手动输入 Docker 网站域名后回车'
@@ -262,6 +295,16 @@
     pickerOpen.value = false
   }
 
+  const brandProvider = (provider?: string) => (provider === 'baota' ? 'btpanel' : provider)
+  const isTencentTarget = (target: Row) => accountMap.value[target.deployAccountId]?.provider === 'tencentcloud'
+
+  function targetTypeLabel(target: Row) {
+    const provider = accountMap.value[target.deployAccountId]?.provider
+    if (provider === 'tencentcloud') return tencentDeployProductNames[target.productType || 'ssl'] || target.productType
+    if (isBTPanelProvider(provider)) return target.productType === 'docker' ? btDeployTypeNames.docker : btDeployTypeNames.site
+    return ''
+  }
+
   function removeTarget(index: number) {
     targets.value = targets.value.filter((_, itemIndex) => itemIndex !== index)
   }
@@ -269,17 +312,10 @@
 
 <style scoped lang="scss">
   .targets-panel {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
     width: 100%;
-    padding: 12px;
-    background: var(--art-gray-100);
-    border: 1px dashed var(--default-border-dashed);
-    border-radius: calc(var(--custom-radius) / 2 + 2px);
-  }
-
-  .targets-panel__head {
-    margin-bottom: 10px;
-    font-size: 13px;
-    color: var(--art-gray-600);
   }
 
   .targets-panel__list {
@@ -288,52 +324,81 @@
     gap: 8px;
   }
 
-  .targets-panel__item {
+  .target-row {
     display: flex;
     gap: 12px;
     align-items: center;
-    justify-content: space-between;
-    padding: 10px 12px;
-    background: var(--default-box-color);
-    border: 1px solid var(--default-border);
-    border-radius: 8px;
-
-    @media (max-width: 560px) {
-      flex-direction: column;
-      align-items: flex-start;
-    }
-  }
-
-  .targets-panel__info {
-    display: flex;
-    flex-direction: column;
-    gap: 2px;
     min-width: 0;
-    font-size: 12px;
-    color: var(--art-gray-600);
+    padding: 10px 12px;
+    background: var(--art-gray-100);
+    border: 1px solid transparent;
+    border-radius: 8px;
+    transition: border-color 0.2s;
 
-    strong {
-      font-size: 14px;
-      color: var(--art-gray-900);
+    &:hover {
+      border-color: var(--el-color-primary-light-7);
     }
 
-    span {
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
+    &.is-disabled {
+      opacity: 0.6;
     }
   }
 
-  .targets-panel__actions {
+  .target-row__main {
     display: flex;
-    flex: none;
+    flex: 1;
+    flex-direction: column;
+    gap: 3px;
+    min-width: 0;
+  }
+
+  .target-row__title {
+    display: flex;
     gap: 6px;
     align-items: center;
+    min-width: 0;
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--art-gray-900);
+  }
+
+  .target-row__sub {
+    display: flex;
+    min-width: 0;
+    font-size: 12px;
+    color: var(--art-gray-500);
+  }
+
+  .target-row__actions {
+    display: flex;
+    flex: none;
+    align-items: center;
+
+    .el-button + .el-button {
+      margin-left: 2px;
+    }
+  }
+
+  .targets-panel__empty {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    align-items: center;
+    padding: 20px 12px;
+    font-size: 13px;
+    color: var(--art-gray-500);
+    text-align: center;
+    background: var(--art-gray-100);
+    border-radius: 8px;
+  }
+
+  .targets-panel__empty-icon {
+    font-size: 24px;
+    color: var(--art-gray-400);
   }
 
   .targets-panel__add {
     width: 100%;
-    margin-top: 10px;
     border-style: dashed;
   }
 
@@ -347,10 +412,35 @@
     display: flex;
     gap: 4px;
     align-items: center;
-    margin-top: 4px;
+    margin-top: 6px;
     font-size: 14px;
     font-weight: 600;
     color: var(--art-gray-900);
+  }
+
+  .targets-picker__label--inline {
+    justify-content: space-between;
+  }
+
+  .targets-picker__sublabel {
+    font-size: 13px;
+    color: var(--art-gray-600);
+  }
+
+  .targets-picker__row {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+
+    @media (max-width: 560px) {
+      grid-template-columns: 1fr;
+    }
+  }
+
+  .targets-picker__hint {
+    margin-top: -4px;
+    font-size: 12px;
+    color: var(--art-gray-500);
   }
 
   .targets-picker__help {

@@ -108,6 +108,7 @@
     display: flex;
     flex-direction: column;
     gap: 12px;
+    width: 100%;
   }
 
   .cert-picker__head {
@@ -169,6 +170,10 @@
       border-color: var(--el-color-primary);
       box-shadow: 0 0 0 1px var(--el-color-primary) inset;
     }
+  }
+
+  .cert-picker__foot {
+    margin-top: auto;
   }
 
   .cert-picker__top,
