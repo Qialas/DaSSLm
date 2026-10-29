@@ -41,7 +41,7 @@ func TestTencentCloud(ctx context.Context, account model.DeployAccount, client *
 			RequestID  string             `json:"RequestId"`
 		} `json:"Response"`
 	}
-	trace, err := tencentSSLRequest(ctx, account, client, "DescribeCertificates", map[string]any{"Offset": 0, "Limit": 1, "CertificateType": "SVR"}, &out)
+	trace, err := tencentSSLRequest(ctx, account, client, "", "DescribeCertificates", map[string]any{"Offset": 0, "Limit": 1, "CertificateType": "SVR"}, &out)
 	if err != nil {
 		return trace, err
 	}
@@ -67,7 +67,7 @@ func uploadTencentCertificate(ctx context.Context, account model.DeployAccount, 
 		"Alias":                 firstNonEmptyDeploy(alias, "DaSSLm上传证书"),
 		"Repeatable":            false,
 	}
-	trace, err := tencentSSLRequest(ctx, account, client, "UploadCertificate", payload, &out)
+	trace, err := tencentSSLRequest(ctx, account, client, "", "UploadCertificate", payload, &out)
 	if err != nil {
 		return "", trace, err
 	}
@@ -81,9 +81,94 @@ func uploadTencentCertificate(ctx context.Context, account model.DeployAccount, 
 	return certificateID, trace, nil
 }
 
+// tencentRegionRequired 官方文档中要求传公共参数 Region 的产品（本项目支持的部分）。
+var tencentRegionRequired = map[string]bool{"clb": true, "waf": true, "apigateway": true, "cos": true}
+
+// NormalizeTencentProduct 规范腾讯云部署产品，取值与 DeployCertificateInstance 的 ResourceType 一致；
+// ssl 表示只上传到证书管理。旧数据中的 eo 即 EdgeOne，官方取值为 teo。
+func NormalizeTencentProduct(value string) (string, error) {
+	product := strings.ToLower(strings.TrimSpace(value))
+	switch product {
+	case "", "ssl":
+		return "ssl", nil
+	case "eo", "teo":
+		return "teo", nil
+	case "cdn", "waf", "clb", "apigateway", "cos":
+		return product, nil
+	default:
+		return "", fmt.Errorf("不支持的腾讯云部署产品：%s", value)
+	}
+}
+
+// TencentDeployInstance 按官方 InstanceIdList 格式校验部署目标，返回规范后的产品、实例标识和地域。
+// 地域只在官方要求的产品上保留，其他产品忽略。
+func TencentDeployInstance(target Target) (product, instanceID, region string, err error) {
+	product, err = NormalizeTencentProduct(target.ProductType)
+	if err != nil || product == "ssl" {
+		return product, "", "", err
+	}
+	name := tencentProductName(product)
+	if tencentRegionRequired[product] {
+		region = strings.TrimSpace(target.Region)
+		if region == "" {
+			return product, "", "", fmt.Errorf("腾讯云%s需要填写地域", name)
+		}
+	}
+	raw := firstNonEmptyDeploy(target.ResourceID, target.SiteName)
+	if raw == "" {
+		return product, "", "", fmt.Errorf("请填写腾讯云%s的部署资源", name)
+	}
+	parts := strings.Split(raw, "|")
+	for i := range parts {
+		parts[i] = strings.TrimSpace(parts[i])
+	}
+	filled := func(values []string) bool {
+		for _, value := range values {
+			if value == "" {
+				return false
+			}
+		}
+		return true
+	}
+	switch product {
+	case "cdn":
+		// 官方格式：域名|on，未带开关时默认 on
+		if len(parts) == 1 && parts[0] != "" {
+			parts = append(parts, "on")
+		}
+		if len(parts) != 2 || parts[0] == "" || (parts[1] != "on" && parts[1] != "off") {
+			return product, "", "", fmt.Errorf("腾讯云CDN部署资源应为加速域名")
+		}
+	case "teo", "waf":
+		if len(parts) != 1 || parts[0] == "" {
+			return product, "", "", fmt.Errorf("腾讯云%s部署资源应为单个域名", name)
+		}
+	case "clb":
+		// 官方格式：负载均衡ID|监听器ID，监听器开启 SNI 时再加 |域名
+		if (len(parts) != 2 && len(parts) != 3) || !filled(parts) {
+			return product, "", "", fmt.Errorf("腾讯云CLB需要填写负载均衡ID和监听器ID")
+		}
+	case "apigateway":
+		if len(parts) != 2 || !filled(parts) {
+			return product, "", "", fmt.Errorf("腾讯云API网关需要填写服务ID和自定义域名")
+		}
+	case "cos":
+		if len(parts) != 3 || !filled(parts) {
+			return product, "", "", fmt.Errorf("腾讯云COS需要填写存储桶和自定义域名")
+		}
+		if parts[0] != region {
+			return product, "", "", fmt.Errorf("腾讯云COS存储桶地域（%s）与所选地域（%s）不一致", parts[0], region)
+		}
+	}
+	return product, strings.Join(parts, "|"), region, nil
+}
+
 func deployTencentCertificateInstance(ctx context.Context, account model.DeployAccount, client *http.Client, certificateID string, target Target, uploadTrace *Trace) (*Trace, error) {
-	productType := strings.ToLower(strings.TrimSpace(target.ProductType))
-	if productType == "" || productType == "ssl" {
+	product, instanceID, region, err := TencentDeployInstance(target)
+	if err != nil {
+		return uploadTrace, err
+	}
+	if product == "ssl" {
 		if uploadTrace != nil {
 			uploadTrace.ResponseBody = strings.TrimSpace(uploadTrace.ResponseBody)
 			if uploadTrace.ResponseBody == "" {
@@ -92,36 +177,20 @@ func deployTencentCertificateInstance(ctx context.Context, account model.DeployA
 		}
 		return uploadTrace, nil
 	}
-	instanceID := firstNonEmptyDeploy(target.ResourceID, target.SiteName)
-	if instanceID == "" {
-		return uploadTrace, fmt.Errorf("请选择或填写腾讯云%s部署资源", tencentProductName(productType))
-	}
 	payload := map[string]any{
 		"CertificateId":  certificateID,
-		"ResourceType":   productType,
+		"ResourceType":   product,
 		"InstanceIdList": []string{instanceID},
-	}
-	if strings.TrimSpace(target.Region) != "" {
-		payload["Region"] = strings.TrimSpace(target.Region)
-	}
-	if strings.TrimSpace(target.ExtraConfig) != "" {
-		var extra map[string]any
-		if err := json.Unmarshal([]byte(target.ExtraConfig), &extra); err != nil {
-			return uploadTrace, fmt.Errorf("腾讯云部署扩展配置不是有效JSON：%w", err)
-		}
-		for key, value := range extra {
-			payload[key] = value
-		}
 	}
 	var out struct {
 		Response struct {
-			Error     *tencentCloudError `json:"Error"`
-			DeployID  string             `json:"DeployId"`
-			TaskID    string             `json:"TaskId"`
-			RequestID string             `json:"RequestId"`
+			Error          *tencentCloudError `json:"Error"`
+			DeployRecordID json.Number        `json:"DeployRecordId"`
+			DeployStatus   json.Number        `json:"DeployStatus"`
+			RequestID      string             `json:"RequestId"`
 		} `json:"Response"`
 	}
-	trace, err := tencentSSLRequest(ctx, account, client, "DeployCertificateInstance", payload, &out)
+	trace, err := tencentSSLRequest(ctx, account, client, region, "DeployCertificateInstance", payload, &out)
 	combined := combineTencentDeployTrace(uploadTrace, trace)
 	if err != nil {
 		return combined, err
@@ -152,7 +221,7 @@ func tencentProductName(productType string) string {
 	switch strings.ToLower(strings.TrimSpace(productType)) {
 	case "cdn":
 		return "CDN"
-	case "eo":
+	case "eo", "teo":
 		return "EdgeOne"
 	case "clb":
 		return "CLB"
@@ -167,7 +236,8 @@ func tencentProductName(productType string) string {
 	}
 }
 
-func tencentSSLRequest(ctx context.Context, account model.DeployAccount, client *http.Client, action string, payload any, out any) (*Trace, error) {
+// tencentSSLRequest 调用腾讯云 SSL 接口；region 为公共参数 Region，非空时通过 X-TC-Region 请求头传递。
+func tencentSSLRequest(ctx context.Context, account model.DeployAccount, client *http.Client, region, action string, payload any, out any) (*Trace, error) {
 	if strings.TrimSpace(account.AccessKey) == "" || strings.TrimSpace(account.SecretKey) == "" {
 		return nil, fmt.Errorf("请先填写腾讯云SecretId和SecretKey")
 	}
@@ -177,6 +247,9 @@ func tencentSSLRequest(ctx context.Context, account model.DeployAccount, client 
 	}
 	timestamp := time.Now().Unix()
 	authorization, headers := tencentAuthorization(account, action, raw, timestamp)
+	if region != "" {
+		headers["X-TC-Region"] = region
+	}
 	trace := &Trace{
 		RequestURL:     "https://" + tencentSSLHost,
 		RequestMethod:  http.MethodPost,
@@ -193,6 +266,9 @@ func tencentSSLRequest(ctx context.Context, account model.DeployAccount, client 
 	req.Header.Set("X-TC-Action", action)
 	req.Header.Set("X-TC-Timestamp", headers["X-TC-Timestamp"])
 	req.Header.Set("X-TC-Version", tencentSSLVersion)
+	if region != "" {
+		req.Header.Set("X-TC-Region", region)
+	}
 	if client == nil {
 		client = &http.Client{Timeout: 30 * time.Second}
 	}

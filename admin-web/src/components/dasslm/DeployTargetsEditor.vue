@@ -19,9 +19,7 @@
             <span class="truncate">
               {{ accountMap[target.deployAccountId]?.name || `账号#${target.deployAccountId}` }} ·
               {{ deployProviderLabel(accountMap[target.deployAccountId]?.provider) }}
-              <template v-if="isTencentTarget(target) && target.resourceId && target.resourceId !== target.siteName">
-                · {{ target.resourceId }}
-              </template>
+              <template v-if="isTencentTarget(target) && tencentTargetDetail(target)"> · {{ tencentTargetDetail(target) }}</template>
               <template v-if="target.remark"> · {{ target.remark }}</template>
             </span>
           </div>
@@ -69,23 +67,61 @@
           </ElRadioGroup>
         </template>
 
+        <template v-if="isTencent">
+          <div class="targets-picker__label">部署到</div>
+          <ElSelect v-model="draft.productType" class="w-full" @change="onTencentProductChange">
+            <ElOption v-for="item in tencentDeployProducts" :key="item.value" :label="item.label" :value="item.value" />
+          </ElSelect>
+          <div class="targets-picker__hint">{{ tencentProductDesc }}</div>
+
+          <template v-if="tencentNeedsRegion">
+            <div class="targets-picker__label">地域</div>
+            <ElSelect v-if="draft.productType === 'waf'" v-model="draft.region" class="w-full" placeholder="选择 WAF 所在地域">
+              <ElOption v-for="item in tencentWafRegions" :key="item.value" :label="item.label" :value="item.value" />
+            </ElSelect>
+            <ElSelect
+              v-else
+              v-model="draft.region"
+              class="w-full"
+              filterable
+              allow-create
+              default-first-option
+              placeholder="选择或输入地域，如 ap-guangzhou"
+            >
+              <ElOption v-for="item in tencentRegions" :key="item.value" :label="`${item.label}（${item.value}）`" :value="item.value" />
+            </ElSelect>
+          </template>
+
+          <template v-if="draft.productType === 'clb'">
+            <div class="targets-picker__label">负载均衡</div>
+            <div class="targets-picker__row">
+              <ElInput v-model="draft.tcLoadBalancerId" placeholder="负载均衡ID，如 lb-xxxxxxxx" />
+              <ElInput v-model="draft.tcListenerId" placeholder="监听器ID，如 lbl-xxxxxxxx" />
+            </div>
+            <div class="targets-picker__label">域名（可选）</div>
+            <ElInput v-model="draft.tcDomain" placeholder="监听器开启 SNI 时填写，未开启留空" />
+          </template>
+          <template v-else-if="draft.productType === 'apigateway'">
+            <div class="targets-picker__label">API 网关服务</div>
+            <ElInput v-model="draft.tcServiceId" placeholder="服务ID，如 service-xxxxxxxx" />
+            <div class="targets-picker__label">自定义域名</div>
+            <ElInput v-model="draft.tcDomain" placeholder="服务绑定的自定义域名" />
+          </template>
+          <template v-else-if="draft.productType === 'cos'">
+            <div class="targets-picker__label">存储桶</div>
+            <ElInput v-model="draft.tcBucket" placeholder="存储桶名称，如 examplebucket-1250000000" />
+            <div class="targets-picker__label">自定义域名</div>
+            <ElInput v-model="draft.tcDomain" placeholder="存储桶绑定的自定义域名" />
+          </template>
+        </template>
+
+        <template v-if="showSiteSelect">
         <div class="targets-picker__label">
           {{ siteLabel }}
-          <ElTooltip :content="siteHelp" placement="top">
+          <ElTooltip v-if="!isTencent" :content="siteHelp" placement="top">
             <ArtSvgIcon icon="ri:question-line" class="targets-picker__help" />
           </ElTooltip>
         </div>
-        <template v-if="isTencent">
-          <div class="targets-picker__sublabel">部署到的腾讯云产品</div>
-          <ElSelect v-model="draft.productType" class="w-full">
-            <ElOption v-for="item in tencentDeployProducts" :key="item.value" :label="item.label" :value="item.value" />
-          </ElSelect>
-          <div class="targets-picker__row">
-            <ElInput v-model="draft.resourceId" placeholder="资源ID / 域名 / 实例标识" />
-            <ElInput v-model="draft.region" placeholder="地域（可选），如 ap-guangzhou" />
-          </div>
-          <div class="targets-picker__sublabel">站点/服务名称</div>
-        </template>
         <ElSelect
           v-model="draft.siteNames"
           class="w-full"
@@ -108,6 +144,7 @@
           </ElOption>
         </ElSelect>
         <div class="targets-picker__hint">{{ siteHint }}</div>
+        </template>
 
         <div class="targets-picker__label targets-picker__label--inline">
           <span>启用此目标</span>
@@ -135,8 +172,13 @@
     deployProviderLabel,
     isBTPanelProvider,
     normalizeSiteNames,
+    normalizeTencentProduct,
     tencentDeployProductNames,
     tencentDeployProducts,
+    tencentMultiDomainProducts,
+    tencentRegionProducts,
+    tencentRegions,
+    tencentWafRegions,
     toMap,
     useResponsiveSize
   } from './meta'
@@ -162,7 +204,14 @@
   const isBTPanel = computed(() => isBTPanelProvider(draftAccount.value?.provider))
   const isTencent = computed(() => draftAccount.value?.provider === 'tencentcloud')
   const isBTDocker = computed(() => isBTPanel.value && draft.btType === 'docker')
+  const tencentProductDesc = computed(
+    () => tencentDeployProducts.find((item) => item.value === draft.productType)?.desc || ''
+  )
+  const tencentNeedsRegion = computed(() => tencentRegionProducts.has(draft.productType))
+  /** 腾讯云只有 CDN、EdgeOne、WAF 使用多域名输入，其他产品用各自的字段 */
+  const showSiteSelect = computed(() => !isTencent.value || tencentMultiDomainProducts.has(draft.productType))
   const siteLabel = computed(() => {
+    if (isTencent.value) return draft.productType === 'cdn' ? '加速域名' : '域名'
     if (isBTDocker.value) return 'Docker 网站域名'
     return isBTPanel.value ? '站点名称' : '站点/服务名称'
   })
@@ -174,6 +223,7 @@
   const siteHint = computed(() => {
     if (isBTDocker.value) return '宝塔面板不提供 Docker 网站列表，输入域名后按回车，可添加多个。'
     if (isBTPanel.value) return '可从宝塔站点列表中选择，也可直接输入站点名后按回车，可添加多个。'
+    if (isTencent.value) return '输入域名后按回车，可添加多个，每个域名会作为一个部署目标。'
     return '输入后按回车，可添加多个。'
   })
   const siteNoDataText = computed(() => {
@@ -196,6 +246,7 @@
         siteNames: normalizeSiteNames(target.siteName),
         btType: target.productType === 'docker' ? 'docker' : 'site'
       })
+      if (accountMap.value[target.deployAccountId]?.provider === 'tencentcloud') fillTencentDraft(target)
       editingIndex.value = index ?? null
     } else {
       Object.assign(draft, {
@@ -211,9 +262,72 @@
   }
 
   function onAccountChange(_id: number, account: Row) {
-    draft.productType = account.provider === 'tencentcloud' ? draft.productType || 'ssl' : ''
+    if (account.provider === 'tencentcloud') {
+      draft.productType = draft.productType || 'ssl'
+      onTencentProductChange()
+    } else {
+      draft.productType = ''
+    }
     siteOptions.value = []
     searchSites('')
+  }
+
+  /** 把已保存的腾讯云实例标识（官方 InstanceIdList 格式）拆回各个输入框 */
+  function fillTencentDraft(target: Row) {
+    const product = normalizeTencentProduct(target.productType)
+    const parts = String(target.resourceId || target.siteName || '').split('|')
+    draft.productType = product
+    draft.region = target.region || ''
+    draft.siteNames = tencentMultiDomainProducts.has(product) ? normalizeSiteNames(parts[0]) : []
+    if (product === 'clb') {
+      Object.assign(draft, { tcLoadBalancerId: parts[0] || '', tcListenerId: parts[1] || '', tcDomain: parts[2] || '' })
+    } else if (product === 'apigateway') {
+      Object.assign(draft, { tcServiceId: parts[0] || '', tcDomain: parts[1] || '' })
+    } else if (product === 'cos') {
+      Object.assign(draft, { tcBucket: parts[1] || '', tcDomain: parts[2] || '' })
+      draft.region = draft.region || parts[0] || ''
+    }
+  }
+
+  function onTencentProductChange() {
+    // 切换产品时清空上一个产品的字段，避免把负载均衡ID等带成域名；WAF 地域默认中国大陆
+    draft.region = draft.productType === 'waf' ? 'ap-guangzhou' : ''
+    Object.assign(draft, { tcLoadBalancerId: '', tcListenerId: '', tcServiceId: '', tcBucket: '', tcDomain: '' })
+    draft.siteNames = props.defaultSiteName ? [props.defaultSiteName] : []
+  }
+
+  /** 按产品组装官方 InstanceIdList 格式的部署目标；缺少必填项时返回提示文字 */
+  function buildTencentTargets(): Row[] | string {
+    const product = draft.productType || 'ssl'
+    const region = tencentRegionProducts.has(product) ? String(draft.region || '').trim() : ''
+    if (tencentRegionProducts.has(product) && !region) return '请选择地域'
+    const domain = String(draft.tcDomain || '').trim()
+    const base = { productType: product, region, resourceName: '', extraConfig: '' }
+    if (product === 'ssl') {
+      return [{ ...base, siteName: props.defaultSiteName || '证书管理', resourceId: '' }]
+    }
+    if (tencentMultiDomainProducts.has(product)) {
+      const domains = normalizeSiteNames(draft.siteNames)
+      if (!domains.length) return `请输入${siteLabel.value}`
+      return domains.map((name) => ({ ...base, siteName: name, resourceId: name }))
+    }
+    if (product === 'clb') {
+      const lb = String(draft.tcLoadBalancerId || '').trim()
+      const listener = String(draft.tcListenerId || '').trim()
+      if (!lb || !listener) return '请填写负载均衡ID和监听器ID'
+      return [{ ...base, siteName: domain || lb, resourceId: [lb, listener, domain].filter(Boolean).join('|') }]
+    }
+    if (product === 'apigateway') {
+      const service = String(draft.tcServiceId || '').trim()
+      if (!service || !domain) return '请填写服务ID和自定义域名'
+      return [{ ...base, siteName: domain, resourceId: `${service}|${domain}` }]
+    }
+    if (product === 'cos') {
+      const bucket = String(draft.tcBucket || '').trim()
+      if (!bucket || !domain) return '请填写存储桶和自定义域名'
+      return [{ ...base, siteName: domain, resourceId: `${region}|${bucket}|${domain}` }]
+    }
+    return '不支持的腾讯云产品'
   }
 
   function onBTTypeChange() {
@@ -258,26 +372,39 @@
       ElMessage.warning('请选择一个部署账号')
       return
     }
-    const siteNames = normalizeSiteNames(draft.siteNames?.length ? draft.siteNames : draft.siteName || props.defaultSiteName)
-    if (!siteNames.length) {
-      ElMessage.warning(`请输入${siteLabel.value}`)
-      return
-    }
-    const tencent = isTencent.value
-    const productType = tencent ? draft.productType || 'ssl' : isBTDocker.value ? 'docker' : ''
-    const nextTargets = siteNames.map((siteName) => ({
+    const common = {
       deployAccountId: Number(draft.deployAccountId),
-      siteName,
-      productType,
-      region: tencent ? draft.region || '' : '',
-      resourceId: tencent ? draft.resourceId || siteName : '',
-      resourceName: tencent ? draft.resourceName || '' : '',
-      extraConfig: tencent ? draft.extraConfig || '' : '',
       status: draft.status || 'enabled',
       remark: draft.remark || ''
-    }))
+    }
+    let nextTargets: Row[]
+    if (isTencent.value) {
+      const built = buildTencentTargets()
+      if (typeof built === 'string') {
+        ElMessage.warning(built)
+        return
+      }
+      nextTargets = built.map((item) => ({ ...common, ...item }))
+    } else {
+      const siteNames = normalizeSiteNames(draft.siteNames?.length ? draft.siteNames : draft.siteName || props.defaultSiteName)
+      if (!siteNames.length) {
+        ElMessage.warning(`请输入${siteLabel.value}`)
+        return
+      }
+      const productType = isBTDocker.value ? 'docker' : ''
+      nextTargets = siteNames.map((siteName) => ({
+        ...common,
+        siteName,
+        productType,
+        region: '',
+        resourceId: '',
+        resourceName: '',
+        extraConfig: ''
+      }))
+    }
     const rows = targets.value.filter((_, index) => index !== editingIndex.value)
-    const targetKey = (item: Row) => `${Number(item.deployAccountId)}:${item.productType || ''}:${item.siteName}`
+    const targetKey = (item: Row) =>
+      `${Number(item.deployAccountId)}:${item.productType || ''}:${item.resourceId || item.siteName}`
     const existing = new Set(rows.map(targetKey))
     const unique = nextTargets.filter((item) => {
       const key = targetKey(item)
@@ -298,9 +425,26 @@
   const brandProvider = (provider?: string) => (provider === 'baota' ? 'btpanel' : provider)
   const isTencentTarget = (target: Row) => accountMap.value[target.deployAccountId]?.provider === 'tencentcloud'
 
+  /** 腾讯云目标的资源说明，把官方实例标识拆成可读文字 */
+  function tencentTargetDetail(target: Row) {
+    const product = normalizeTencentProduct(target.productType)
+    const parts = String(target.resourceId || '').split('|')
+    const regionName = (value?: string) =>
+      [...tencentRegions, ...tencentWafRegions].find((item) => item.value === value)?.label || value || ''
+    const details: string[] = []
+    if (product === 'clb') details.push(`负载均衡 ${parts[0] || '-'} / 监听器 ${parts[1] || '-'}`)
+    if (product === 'apigateway') details.push(`服务 ${parts[0] || '-'}`)
+    if (product === 'cos') details.push(`存储桶 ${parts[1] || '-'}`)
+    if (product === 'waf') details.push(regionName(target.region))
+    else if (target.region) details.push(regionName(target.region))
+    return details.filter(Boolean).join(' · ')
+  }
+
   function targetTypeLabel(target: Row) {
     const provider = accountMap.value[target.deployAccountId]?.provider
-    if (provider === 'tencentcloud') return tencentDeployProductNames[target.productType || 'ssl'] || target.productType
+    if (provider === 'tencentcloud') {
+      return tencentDeployProductNames[normalizeTencentProduct(target.productType)] || target.productType
+    }
     if (isBTPanelProvider(provider)) return target.productType === 'docker' ? btDeployTypeNames.docker : btDeployTypeNames.site
     return ''
   }

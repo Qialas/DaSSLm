@@ -142,19 +142,62 @@ export const btDeployTypeNames: Record<string, string> = Object.fromEntries(
   btDeployTypes.map((item) => [item.value, item.label])
 )
 
+/**
+ * 腾讯云部署产品，取值与 SSL 接口 DeployCertificateInstance 的 ResourceType 一致（ssl 表示只上传）。
+ * 只有官方要求传地域的产品（CLB、WAF、API网关、COS）才需要填写地域。
+ */
 export const tencentDeployProducts = [
-  { label: '仅上传到证书管理', value: 'ssl' },
-  { label: 'CDN', value: 'cdn' },
-  { label: 'EdgeOne', value: 'eo' },
-  { label: 'CLB', value: 'clb' },
-  { label: 'WAF', value: 'waf' },
-  { label: 'API网关', value: 'apigateway' },
-  { label: 'COS', value: 'cos' }
+  { label: '仅上传到证书管理', value: 'ssl', desc: '只把证书上传到腾讯云 SSL 证书管理，不部署到具体产品。' },
+  { label: 'CDN', value: 'cdn', desc: '部署到 CDN 加速域名，可一次添加多个域名。' },
+  { label: 'EdgeOne', value: 'teo', desc: '部署到 EdgeOne 加速域名，可一次添加多个域名。' },
+  { label: 'WAF', value: 'waf', desc: '部署到 WAF 防护域名，可一次添加多个域名。' },
+  { label: 'CLB 负载均衡', value: 'clb', desc: '部署到 CLB 的 HTTPS 监听器；监听器开启 SNI 时还需填写域名。' },
+  { label: 'API 网关', value: 'apigateway', desc: '部署到 API 网关服务的自定义域名。' },
+  { label: 'COS 对象存储', value: 'cos', desc: '部署到存储桶绑定的自定义域名。' }
 ]
 
-export const tencentDeployProductNames: Record<string, string> = Object.fromEntries(
-  tencentDeployProducts.map((item) => [item.value, item.label])
-)
+export const tencentDeployProductNames: Record<string, string> = {
+  ...Object.fromEntries(tencentDeployProducts.map((item) => [item.value, item.label])),
+  eo: 'EdgeOne'
+}
+
+/** 旧数据中的 eo 即 EdgeOne，官方取值为 teo */
+export function normalizeTencentProduct(value?: string) {
+  if (!value || value === 'ssl') return 'ssl'
+  return value === 'eo' ? 'teo' : value
+}
+
+/** 官方要求传地域的产品 */
+export const tencentRegionProducts = new Set(['clb', 'waf', 'apigateway', 'cos'])
+
+/** 可一次添加多个域名的产品 */
+export const tencentMultiDomainProducts = new Set(['cdn', 'teo', 'waf'])
+
+/** WAF 只区分中国大陆与非中国大陆 */
+export const tencentWafRegions = [
+  { label: '中国大陆', value: 'ap-guangzhou' },
+  { label: '非中国大陆', value: 'ap-seoul' }
+]
+
+/** 常用地域，也可手动输入其他地域 */
+export const tencentRegions = [
+  { label: '广州', value: 'ap-guangzhou' },
+  { label: '上海', value: 'ap-shanghai' },
+  { label: '北京', value: 'ap-beijing' },
+  { label: '成都', value: 'ap-chengdu' },
+  { label: '重庆', value: 'ap-chongqing' },
+  { label: '南京', value: 'ap-nanjing' },
+  { label: '中国香港', value: 'ap-hongkong' },
+  { label: '新加坡', value: 'ap-singapore' },
+  { label: '东京', value: 'ap-tokyo' },
+  { label: '首尔', value: 'ap-seoul' },
+  { label: '曼谷', value: 'ap-bangkok' },
+  { label: '雅加达', value: 'ap-jakarta' },
+  { label: '硅谷', value: 'na-siliconvalley' },
+  { label: '弗吉尼亚', value: 'na-ashburn' },
+  { label: '法兰克福', value: 'eu-frankfurt' },
+  { label: '圣保罗', value: 'sa-saopaulo' }
+]
 
 export const notificationChannels: (CardOption & { tag: TagType })[] = [
   { value: 'wecom_webhook', label: '企业微信', desc: 'WeCom Bot', image: wecomIcon, tag: 'success' },

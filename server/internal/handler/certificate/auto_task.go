@@ -226,7 +226,21 @@ func (h *AutoTaskHandler) buildAutoDeployTask(req autoTaskRequest, previous *mod
 			}
 			productType = normalized
 		}
-		key := fmt.Sprintf("%d:%s:%s:%s", deployAccount.ID, productType, firstNonEmpty(item.ResourceID, siteName), siteName)
+		region := strings.TrimSpace(item.Region)
+		resourceID := strings.TrimSpace(item.ResourceID)
+		if deployservice.IsTencentCloudProvider(deployAccount.Provider) {
+			product, instanceID, normalizedRegion, err := deployservice.TencentDeployInstance(deployservice.Target{
+				SiteName:    siteName,
+				ProductType: productType,
+				Region:      region,
+				ResourceID:  resourceID,
+			})
+			if err != nil {
+				return model.AutoTask{}, nil, err
+			}
+			productType, region, resourceID = product, normalizedRegion, instanceID
+		}
+		key := fmt.Sprintf("%d:%s:%s:%s", deployAccount.ID, productType, firstNonEmpty(resourceID, siteName), siteName)
 		if _, ok := seen[key]; ok {
 			return model.AutoTask{}, nil, fmt.Errorf("部署目标重复：%s", siteName)
 		}
@@ -235,8 +249,8 @@ func (h *AutoTaskHandler) buildAutoDeployTask(req autoTaskRequest, previous *mod
 			DeployAccountID: deployAccount.ID,
 			SiteName:        siteName,
 			ProductType:     productType,
-			Region:          strings.TrimSpace(item.Region),
-			ResourceID:      strings.TrimSpace(item.ResourceID),
+			Region:          region,
+			ResourceID:      resourceID,
 			ResourceName:    strings.TrimSpace(item.ResourceName),
 			ExtraConfig:     strings.TrimSpace(item.ExtraConfig),
 			Status:          core.DefaultString(item.Status, model.StatusEnabled),
