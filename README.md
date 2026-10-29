@@ -45,7 +45,7 @@ DaSSLm 面向需要统一管理域名解析、SSL 证书申请、证书资产和
 
 #### 2.下载release包
 
-Linux服务器可以直接在 [release](https://github.com/Qialas/DaSSLm/releases) 中下载打包好的 `dasslm-server-linux-amd64-v版本号.tar.gz`（ARM 服务器下载 `arm64` 版本），上传到对应目录中并解压
+Linux服务器可以直接在 [release](https://github.com/Qialas/DaSSLm/releases) 中下载打包好的 `dasslm-server-linux-amd64-v版本号.tar.gz`，上传到对应目录中并解压
 
 #### 3.创建Go项目
 
@@ -116,11 +116,11 @@ npm run dev
 
 ```bash
 cd server
-./scripts/package-linux.sh                          # 默认 amd64
-GOARCH=arm64 VERSION=0.0.3 ./scripts/package-linux.sh  # 指定架构，并把版本号写入程序和包名
+./scripts/package-linux.sh                # 打包 amd64
+VERSION=0.0.3 ./scripts/package-linux.sh  # 把版本号写入程序和包名
 ```
 
-打包产物：
+只发布 Linux amd64 版本。打包产物（`dist` 只保留最新一版，打包成功后会自动清理旧版本）：
 
 ```text
 dist/dasslm-server-linux-amd64/dasslm-server
@@ -152,7 +152,7 @@ http://服务器IP:8080/
    - 推送 tag：`git tag v0.0.3 && git push origin v0.0.3`
    - 在 GitHub 仓库的 Actions → Release → Run workflow，填写版本号 `0.0.3`
 
-工作流会校验版本号、跑测试、打包 amd64 / arm64 两个发布包并生成 SHA256，自动创建 Release；Release 已存在时会更新附件和说明。
+工作流会校验版本号、跑测试、打包 amd64 发布包并生成 SHA256，自动创建 Release；Release 已存在时会更新附件和说明。
 
 ## 常用命令
 
@@ -196,6 +196,17 @@ jwt:
 ```
 
 ## 更新说明
+
+### v0.0.3
+
+- 安全：修复 SQL 注入，接口路径中的 ID 必须为数字，非数字 ID 直接拒绝（此前 `DELETE /api/users/1=1` 等请求可删除整表数据）。
+- 安全：角色权限生效。操作员只能管理域名、解析、证书和自动任务，并查看账号与日志；账号增删改、后台用户、系统设置、代理、通知以及日志删除/清理仅管理员可用，前端菜单同步按角色隐藏。
+- 安全：用户角色只能为管理员或操作员；不能停用、降级或删除最后一个启用中的管理员，也不能删除当前登录的自己。
+- 新增：所有用户可在右上角用户菜单中修改自己的密码（需验证原密码，新密码至少 8 位），修改后其他设备上的登录立即失效。
+- 证书：申请失败后自动退避重试；服务重启后不再卡在“创建订单中”；超时未签发的申请自动标记失败；续期时新私钥在签发成功后才替换旧私钥。
+- 证书：新增“重新申请”操作；未签发的证书“吊销”改为“取消申请”，取消时会清理 DNS 验证记录并取消未完成的腾讯云订单。
+- 依赖：前端 vue-i18n 从 9.14 升级到 11.4.16，修复 `escapeParameter` 相关 XSS 漏洞（GHSA-8rc2-428q-7ww3、GHSA-83rm-6c8r-g728），`npm audit` 无漏洞。
+- 打包：只发布 Linux amd64 版本。
 
 ### v0.0.2
 

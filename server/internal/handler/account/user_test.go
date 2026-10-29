@@ -25,6 +25,8 @@ func TestUserUpdateBumpsTokenVersion(t *testing.T) {
 	}
 	user := model.User{Username: "dave", PasswordHash: "x", Role: model.RoleOperator, Status: model.StatusEnabled}
 	db.Create(&user)
+	// 另有一个启用中的管理员，dave 升为管理员后才允许被停用
+	db.Create(&model.User{Username: "root", PasswordHash: "x", Role: model.RoleAdmin, Status: model.StatusEnabled})
 
 	r := gin.New()
 	r.PUT("/users/:id", NewUserHandler(db).Update)

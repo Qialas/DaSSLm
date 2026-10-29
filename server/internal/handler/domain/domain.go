@@ -5,7 +5,6 @@ import (
 	core "dasslm/server/internal/handler"
 	"fmt"
 	"net/http"
-	"strconv"
 	"strings"
 	"time"
 
@@ -107,7 +106,7 @@ func (h *DomainHandler) Create(c *gin.Context) {
 
 func (h *DomainHandler) ProviderDomains(c *gin.Context) {
 	var account model.DomainAccount
-	if err := h.db.First(&account, c.Param("id")).Error; err != nil {
+	if err := h.db.First(&account, core.ParamID(c, "id")).Error; err != nil {
 		core.Fail(c, http.StatusNotFound, "域名账号不存在")
 		return
 	}
@@ -136,7 +135,7 @@ func (h *DomainHandler) ProviderDomains(c *gin.Context) {
 }
 
 func (h *DomainHandler) RefreshExpires(c *gin.Context) {
-	id, _ := strconv.Atoi(c.Param("id"))
+	id := core.ParamID(c, "id")
 	var domain model.Domain
 	if err := h.db.First(&domain, id).Error; err != nil {
 		core.Fail(c, http.StatusNotFound, "域名不存在")
@@ -164,7 +163,7 @@ func (h *DomainHandler) RefreshExpires(c *gin.Context) {
 }
 
 func (h *DomainHandler) Whois(c *gin.Context) {
-	id, _ := strconv.Atoi(c.Param("id"))
+	id := core.ParamID(c, "id")
 	var domain model.Domain
 	if err := h.db.First(&domain, id).Error; err != nil {
 		core.Fail(c, http.StatusNotFound, "域名不存在")
@@ -306,7 +305,7 @@ func (h *DomainHandler) UpdateRecord(c *gin.Context) {
 		return
 	}
 	var row model.DomainRecord
-	if err := h.db.Where("domain_id = ?", domain.ID).First(&row, c.Param("recordId")).Error; err != nil {
+	if err := h.db.Where("domain_id = ?", domain.ID).First(&row, core.ParamID(c, "recordId")).Error; err != nil {
 		core.Fail(c, http.StatusNotFound, "解析记录不存在")
 		return
 	}
@@ -355,7 +354,7 @@ func (h *DomainHandler) DeleteRecord(c *gin.Context) {
 		return
 	}
 	var row model.DomainRecord
-	if err := h.db.Where("domain_id = ?", domain.ID).First(&row, c.Param("recordId")).Error; err != nil {
+	if err := h.db.Where("domain_id = ?", domain.ID).First(&row, core.ParamID(c, "recordId")).Error; err != nil {
 		core.Fail(c, http.StatusNotFound, "解析记录不存在")
 		return
 	}
@@ -387,7 +386,7 @@ func (h *DomainHandler) DeleteRecord(c *gin.Context) {
 }
 
 func (h *DomainHandler) domainAccount(c *gin.Context) (model.Domain, model.DomainAccount, bool) {
-	id, _ := strconv.Atoi(c.Param("id"))
+	id := core.ParamID(c, "id")
 	var domain model.Domain
 	if err := h.db.First(&domain, id).Error; err != nil {
 		core.Fail(c, http.StatusNotFound, "域名不存在")

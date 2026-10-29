@@ -205,7 +205,7 @@ func TestScanCertificateContentSyncBackfillsValidExistingCertificate(t *testing.
 	if err := db.Create(&row).Error; err != nil {
 		t.Fatalf("create certificate: %v", err)
 	}
-	handler := &CertificateHandler{db: db, contentSyncInFlight: map[uint]struct{}{}}
+	handler := &CertificateHandler{db: db, contentSyncInFlight: map[uint]*certificateWork{}}
 
 	handler.scanCertificateContentSync()
 

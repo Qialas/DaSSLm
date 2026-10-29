@@ -39,7 +39,7 @@ func (h *CertificateHandler) Deploy(c *gin.Context) {
 		core.Fail(c, http.StatusBadRequest, "部署账号已停用")
 		return
 	}
-	if row.Status != certStatusIssued {
+	if !certificateDeployable(row) {
 		core.Fail(c, http.StatusBadRequest, "证书未签发，无法部署")
 		return
 	}
@@ -73,7 +73,7 @@ func deployIssuedCertificate(ctx context.Context, db *gorm.DB, row model.Certifi
 }
 
 func deployIssuedCertificateToTarget(ctx context.Context, db *gorm.DB, row model.Certificate, account model.DeployAccount, target model.AutoTaskTarget) (*deployRequestTrace, error) {
-	if row.Status != certStatusIssued {
+	if !certificateDeployable(row) {
 		return nil, fmt.Errorf("证书未签发，无法部署")
 	}
 	certPEM := strings.TrimSpace(row.CertPEM)

@@ -56,7 +56,7 @@ func (h *UserHandler) List(c *gin.Context) {
 
 func (h *UserHandler) Get(c *gin.Context) {
 	var user model.User
-	if err := h.db.First(&user, c.Param("id")).Error; err != nil {
+	if err := h.db.First(&user, core.ParamID(c, "id")).Error; err != nil {
 		core.Fail(c, http.StatusNotFound, "用户不存在")
 		return
 	}
@@ -67,6 +67,11 @@ func (h *UserHandler) Create(c *gin.Context) {
 	var req userPayload
 	if err := c.ShouldBindJSON(&req); err != nil || req.Username == "" || req.Password == "" {
 		core.Fail(c, http.StatusBadRequest, "请输入用户名和密码")
+		return
+	}
+	role, status := defaultString(req.Role, model.RoleOperator), defaultString(req.Status, model.StatusEnabled)
+	if msg := validateRoleStatus(role, status); msg != "" {
+		core.Fail(c, http.StatusBadRequest, msg)
 		return
 	}
 	hash, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
@@ -80,8 +85,8 @@ func (h *UserHandler) Create(c *gin.Context) {
 		Nickname:     req.Nickname,
 		Email:        req.Email,
 		Phone:        req.Phone,
-		Role:         defaultString(req.Role, model.RoleOperator),
-		Status:       defaultString(req.Status, model.StatusEnabled),
+		Role:         role,
+		Status:       status,
 	}
 	if err := h.db.Create(&user).Error; err != nil {
 		core.Fail(c, http.StatusInternalServerError, "创建用户失败")
@@ -92,7 +97,7 @@ func (h *UserHandler) Create(c *gin.Context) {
 
 func (h *UserHandler) Update(c *gin.Context) {
 	var user model.User
-	if err := h.db.First(&user, c.Param("id")).Error; err != nil {
+	if err := h.db.First(&user, core.ParamID(c, "id")).Error; err != nil {
 		core.Fail(c, http.StatusNotFound, "用户不存在")
 		return
 	}
@@ -122,6 +127,16 @@ func (h *UserHandler) Update(c *gin.Context) {
 	user.Phone = req.Phone
 	user.Role = defaultString(req.Role, user.Role)
 	user.Status = defaultString(req.Status, user.Status)
+	if msg := validateRoleStatus(user.Role, user.Status); msg != "" {
+		core.Fail(c, http.StatusBadRequest, msg)
+		return
+	}
+	if isActiveAdmin(previousRole, previousStatus) && !isActiveAdmin(user.Role, user.Status) {
+		if msg := h.checkOtherActiveAdmin(user.ID); msg != "" {
+			core.Fail(c, http.StatusBadRequest, msg)
+			return
+		}
+	}
 	revoke := user.Role != previousRole || user.Status != previousStatus
 	if req.Password != "" {
 		hash, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
@@ -144,7 +159,27 @@ func (h *UserHandler) Update(c *gin.Context) {
 }
 
 func (h *UserHandler) Delete(c *gin.Context) {
-	if err := h.db.Delete(&model.User{}, c.Param("id")).Error; err != nil {
+	id := core.ParamID(c, "id")
+	if id == 0 {
+		core.Fail(c, http.StatusBadRequest, "用户不存在")
+		return
+	}
+	if id == c.GetUint("userId") {
+		core.Fail(c, http.StatusBadRequest, "不能删除当前登录的用户")
+		return
+	}
+	var user model.User
+	if err := h.db.First(&user, id).Error; err != nil {
+		core.Fail(c, http.StatusNotFound, "用户不存在")
+		return
+	}
+	if isActiveAdmin(user.Role, user.Status) {
+		if msg := h.checkOtherActiveAdmin(user.ID); msg != "" {
+			core.Fail(c, http.StatusBadRequest, msg)
+			return
+		}
+	}
+	if err := h.db.Delete(&model.User{}, id).Error; err != nil {
 		core.Fail(c, http.StatusInternalServerError, "删除用户失败")
 		return
 	}
@@ -156,4 +191,30 @@ func defaultString(value, fallback string) string {
 		return fallback
 	}
 	return value
+}
+
+func validateRoleStatus(role, status string) string {
+	if role != model.RoleAdmin && role != model.RoleOperator {
+		return "角色只能是管理员或操作员"
+	}
+	if status != model.StatusEnabled && status != model.StatusDisabled {
+		return "状态只能是启用或停用"
+	}
+	return ""
+}
+
+func isActiveAdmin(role, status string) bool {
+	return role == model.RoleAdmin && status == model.StatusEnabled
+}
+
+// checkOtherActiveAdmin 确认除指定用户外还有启用中的管理员，避免系统失去管理员。
+func (h *UserHandler) checkOtherActiveAdmin(userID uint) string {
+	var count int64
+	if err := h.db.Model(&model.User{}).Where("role = ? AND status = ? AND id <> ?", model.RoleAdmin, model.StatusEnabled, userID).Count(&count).Error; err != nil {
+		return "检查管理员数量失败"
+	}
+	if count == 0 {
+		return "至少需要保留一个启用中的管理员"
+	}
+	return ""
 }

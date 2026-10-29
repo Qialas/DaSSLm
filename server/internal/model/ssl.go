@@ -53,6 +53,7 @@ type Certificate struct {
 	SerialNumber          string     `gorm:"size:255;comment:证书序列号" json:"serialNumber"`
 	CertPEM               string     `gorm:"type:longtext;comment:证书PEM内容" json:"certPem"`
 	KeyPEM                string     `gorm:"type:longtext;comment:私钥PEM内容" json:"keyPem"`
+	PendingKeyPEM         string     `gorm:"type:longtext;comment:申请或续期中尚未签发的新私钥PEM，签发成功后才替换KeyPEM" json:"-"`
 	ChainPEM              string     `gorm:"type:longtext;comment:证书链PEM内容" json:"chainPem"`
 	ProviderCertificateID string     `gorm:"size:512;index;comment:证书服务商侧证书ID或证书URL" json:"providerCertificateId"`
 	ContentCertificateID  string     `gorm:"size:512;index;comment:当前本地证书内容对应的服务商证书ID或证书URL" json:"-"`
@@ -67,6 +68,9 @@ type Certificate struct {
 	AuthCleanupStatus     string     `gorm:"column:auth_cleanup_status;size:32;comment:验证DNS记录清理状态：pending待清理 running清理中 done已清理 failed清理失败" json:"authCleanupStatus"`
 	ExpiresAt             *time.Time `gorm:"comment:证书过期时间" json:"expiresAt"`
 	RenewBeforeDay        int        `gorm:"not null;default:30;comment:提前续期天数" json:"renewBeforeDay"`
+	RetryCount            int        `gorm:"not null;default:0;comment:申请失败后已自动重试次数" json:"retryCount"`
+	NextRetryAt           *time.Time `gorm:"comment:申请失败后下次自动重试时间" json:"nextRetryAt"`
+	ApplyStartedAt        *time.Time `gorm:"comment:本轮申请开始时间，用于判断签发超时" json:"applyStartedAt"`
 	Status                string     `gorm:"size:32;not null;default:pending;comment:证书状态：queued队列中 pending待申请 applying申请中 dns_added已添加DNS验证 submitted已提交 issued已签发 failed失败 expired已过期 canceled已取消 revoked已吊销" json:"status"`
 }
 

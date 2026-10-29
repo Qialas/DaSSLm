@@ -44,7 +44,7 @@ func (h *NotificationSettingHandler) Create(c *gin.Context) {
 
 func (h *NotificationSettingHandler) Update(c *gin.Context) {
 	var row model.NotificationSetting
-	if err := h.db.First(&row, c.Param("id")).Error; err != nil {
+	if err := h.db.First(&row, core.ParamID(c, "id")).Error; err != nil {
 		core.Fail(c, http.StatusNotFound, "数据不存在")
 		return
 	}
@@ -65,7 +65,7 @@ func (h *NotificationSettingHandler) Update(c *gin.Context) {
 
 func (h *NotificationSettingHandler) Test(c *gin.Context) {
 	var row model.NotificationSetting
-	if err := h.db.First(&row, c.Param("id")).Error; err != nil {
+	if err := h.db.First(&row, core.ParamID(c, "id")).Error; err != nil {
 		core.Fail(c, http.StatusNotFound, "数据不存在")
 		return
 	}

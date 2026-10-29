@@ -45,7 +45,8 @@
               <ElDropdownMenu>
                 <ElDropdownItem command="renew">修改续期天数</ElDropdownItem>
                 <ElDropdownItem command="logs">证书日志</ElDropdownItem>
-                <ElDropdownItem command="revoke" divided>吊销证书</ElDropdownItem>
+                <ElDropdownItem command="reset" :disabled="row.status === 'revoking'">重新申请</ElDropdownItem>
+                <ElDropdownItem command="revoke" divided>{{ revokeActionText(row) }}</ElDropdownItem>
                 <ElDropdownItem command="delete" class="!text-danger">删除</ElDropdownItem>
               </ElDropdownMenu>
             </template>
@@ -256,6 +257,7 @@
     getCertificateDetail,
     listAll,
     listResource,
+    resetCertificate,
     revokeCertificate,
     runAutoTask,
     submitCertificate,
@@ -468,6 +470,15 @@
     }
   }
 
+  // 未签发的证书没有可吊销的证书，“吊销”实际是取消本次申请
+  function isCancelOnlyRevoke(row: Row) {
+    return !['issued', 'expired', 'revoking', 'revoked'].includes(row.status)
+  }
+
+  function revokeActionText(row: Row) {
+    return isCancelOnlyRevoke(row) ? '取消申请' : '吊销证书'
+  }
+
   async function handleMore(value: string | number | object, row: Row) {
     const command = String(value)
     if (command === 'renew') {
@@ -477,15 +488,36 @@
     } else if (command === 'logs') {
       logCertificate.value = row
       logOpen.value = true
-    } else if (command === 'revoke') {
-      const ok = await ElMessageBox.confirm(`确认吊销 ${row.commonName} 的证书？`, '吊销证书', {
+    } else if (command === 'reset') {
+      const message =
+        row.status === 'issued'
+          ? `将为 ${row.commonName} 立即重新申请（续期）证书，新证书签发前当前证书保持不变。是否继续？`
+          : `将停止 ${row.commonName} 当前的申请流程，清理旧订单和DNS验证记录后重新申请。是否继续？`
+      const ok = await ElMessageBox.confirm(message, '重新申请', {
         type: 'warning',
-        confirmButtonText: '吊销',
+        confirmButtonText: '重新申请',
         cancelButtonText: '取消'
       }).catch(() => false)
       if (!ok) return
+      if (verifyingId.value === row.id) stopPolling()
+      await resetCertificate(row.id)
+      ElMessage.success('已重新进入后台申请队列')
+      refreshUpdate()
+    } else if (command === 'revoke') {
+      const cancelOnly = isCancelOnlyRevoke(row)
+      const ok = await ElMessageBox.confirm(
+        cancelOnly ? `确认取消 ${row.commonName} 的证书申请？` : `确认吊销 ${row.commonName} 的证书？`,
+        cancelOnly ? '取消申请' : '吊销证书',
+        {
+          type: 'warning',
+          confirmButtonText: cancelOnly ? '取消申请' : '吊销',
+          cancelButtonText: '返回'
+        }
+      ).catch(() => false)
+      if (!ok) return
+      if (verifyingId.value === row.id) stopPolling()
       await revokeCertificate(row.id)
-      ElMessage.success('已提交吊销，后台将自动验证并检查吊销状态')
+      ElMessage.success(cancelOnly ? '已取消证书申请' : '已提交吊销，后台将自动验证并检查吊销状态')
       refreshUpdate()
     } else if (command === 'delete') {
       const ok = await ElMessageBox.confirm(`确认删除 ${row.commonName}？`, '删除证书', {

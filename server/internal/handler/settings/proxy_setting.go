@@ -43,7 +43,7 @@ func (h *ProxySettingHandler) Create(c *gin.Context) {
 }
 
 func (h *ProxySettingHandler) Update(c *gin.Context) {
-	id := c.Param("id")
+	id := core.ParamID(c, "id")
 	var row model.ProxySetting
 	if err := h.db.First(&row, id).Error; err != nil {
 		core.Fail(c, http.StatusNotFound, "数据不存在")
@@ -66,7 +66,7 @@ func (h *ProxySettingHandler) Update(c *gin.Context) {
 
 func (h *ProxySettingHandler) Test(c *gin.Context) {
 	var row model.ProxySetting
-	if err := h.db.First(&row, c.Param("id")).Error; err != nil {
+	if err := h.db.First(&row, core.ParamID(c, "id")).Error; err != nil {
 		core.Fail(c, http.StatusNotFound, "数据不存在")
 		return
 	}

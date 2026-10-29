@@ -25,6 +25,40 @@ func NewSSLAccountHandler(db *gorm.DB) *SSLAccountHandler {
 	return &SSLAccountHandler{ResourceHandler: core.NewResourceHandler[model.SSLAccount](db), db: db}
 }
 
+// Update 保存SSL账号。修改证书服务、ACME目录地址或EAB后，原ACME账号（URI与私钥）属于旧CA，
+// 必须清空，下次申请时在新CA重新注册，否则会一直用旧账号KID请求新CA而失败。
+func (h *SSLAccountHandler) Update(c *gin.Context) {
+	var row model.SSLAccount
+	if err := h.db.First(&row, core.ParamID(c, "id")).Error; err != nil {
+		core.Fail(c, http.StatusNotFound, "数据不存在")
+		return
+	}
+	previous := row
+	if err := c.ShouldBindJSON(&row); err != nil {
+		core.Fail(c, http.StatusBadRequest, "请求参数错误")
+		return
+	}
+	row.ID = previous.ID
+	row.CreatedAt = previous.CreatedAt
+	if acmeAccountIdentityChanged(previous, row) {
+		row.AccountURI = ""
+		row.AccountKeyPEM = ""
+	}
+	if err := h.db.Save(&row).Error; err != nil {
+		core.Fail(c, http.StatusInternalServerError, "保存失败")
+		return
+	}
+	core.Ok(c, row)
+}
+
+func acmeAccountIdentityChanged(previous, next model.SSLAccount) bool {
+	normalize := func(value string) string { return strings.TrimRight(strings.TrimSpace(value), "/") }
+	return !strings.EqualFold(strings.TrimSpace(previous.Provider), strings.TrimSpace(next.Provider)) ||
+		normalize(acmeDirectoryURL(previous)) != normalize(acmeDirectoryURL(next)) ||
+		strings.TrimSpace(previous.EABKid) != strings.TrimSpace(next.EABKid) ||
+		strings.TrimSpace(previous.EABHmacKey) != strings.TrimSpace(next.EABHmacKey)
+}
+
 func (h *SSLAccountHandler) Certificates(c *gin.Context) {
 	account, found := h.sslAccount(c)
 	if !found {
@@ -139,7 +173,7 @@ func (h *SSLAccountHandler) ImportCertificate(c *gin.Context) {
 
 func (h *SSLAccountHandler) sslAccount(c *gin.Context) (model.SSLAccount, bool) {
 	var account model.SSLAccount
-	if err := h.db.First(&account, c.Param("id")).Error; err != nil {
+	if err := h.db.First(&account, core.ParamID(c, "id")).Error; err != nil {
 		core.Fail(c, http.StatusNotFound, "SSL账号不存在")
 		return account, false
 	}

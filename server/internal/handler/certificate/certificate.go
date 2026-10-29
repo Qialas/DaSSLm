@@ -16,7 +16,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"sort"
 	"strconv"
@@ -48,26 +47,26 @@ const (
 	certStatusRevoking             = "revoking"
 	certStatusRevoked              = "revoked"
 	certFlowInterval               = 10 * time.Second
-	certFlowMaxChecks              = 8640
-	acmeDNSMaxChecks               = 12
 	certificateContentSyncInterval = 10 * time.Minute
 )
 
 type CertificateHandler struct {
 	*core.ResourceHandler[model.Certificate]
-	db                  *gorm.DB
-	applyMu             sync.Mutex
-	applyInFlight       map[uint]struct{}
+	db *gorm.DB
+	// contentSyncInFlight 记录每张证书正在执行的后台任务（申请、签发、同步、吊销），
+	// 同一张证书同一时间只允许一个任务，重新申请/删除时可取消正在执行的任务。
 	contentSyncMu       sync.Mutex
-	contentSyncInFlight map[uint]struct{}
+	contentSyncInFlight map[uint]*certificateWork
+	progressLogMu       sync.Mutex
+	progressLogAt       map[string]time.Time
 }
 
 func NewCertificateHandler(db *gorm.DB) *CertificateHandler {
 	h := &CertificateHandler{
 		ResourceHandler:     core.NewResourceHandler[model.Certificate](db),
 		db:                  db,
-		applyInFlight:       map[uint]struct{}{},
-		contentSyncInFlight: map[uint]struct{}{},
+		contentSyncInFlight: map[uint]*certificateWork{},
+		progressLogAt:       map[string]time.Time{},
 	}
 	h.startCertificateApplyWorker()
 	h.startCertificateExpiryWorker()
@@ -97,14 +96,9 @@ func (h *CertificateHandler) Create(c *gin.Context) {
 		core.Fail(c, http.StatusBadRequest, "请求参数错误")
 		return
 	}
-	domain, account, valid := h.validateRequest(c, req)
+	domain, account, commonName, sans, valid := h.validateRequest(c, req)
 	if !valid {
 		return
-	}
-
-	commonName := strings.TrimSpace(req.CommonName)
-	if commonName == "" {
-		commonName = domain.Name
 	}
 	renewBeforeDay := req.RenewBeforeDay
 	if renewBeforeDay <= 0 {
@@ -115,7 +109,7 @@ func (h *CertificateHandler) Create(c *gin.Context) {
 		DomainID:          domain.ID,
 		SSLAccountID:      account.ID,
 		CommonName:        commonName,
-		SANs:              strings.TrimSpace(req.SANs),
+		SANs:              sans,
 		RenewBeforeDay:    renewBeforeDay,
 		Status:            certStatusPending,
 		ProviderStatusMsg: "已创建证书任务，等待后台自动检查或手动开始申请",
@@ -140,7 +134,7 @@ func (h *CertificateHandler) Create(c *gin.Context) {
 
 func (h *CertificateHandler) Update(c *gin.Context) {
 	var row model.Certificate
-	if err := h.db.First(&row, c.Param("id")).Error; err != nil {
+	if err := h.db.First(&row, core.ParamID(c, "id")).Error; err != nil {
 		core.Fail(c, http.StatusNotFound, "证书不存在")
 		return
 	}
@@ -162,7 +156,7 @@ func (h *CertificateHandler) Update(c *gin.Context) {
 		"renew_before_day": renewBeforeDay,
 	}
 	if req.DomainID > 0 && req.SSLAccountID > 0 {
-		domain, account, valid := h.validateRequest(c, certificateRequest{
+		domain, account, commonName, sans, valid := h.validateRequest(c, certificateRequest{
 			DomainID:       req.DomainID,
 			SSLAccountID:   req.SSLAccountID,
 			CommonName:     req.CommonName,
@@ -172,14 +166,28 @@ func (h *CertificateHandler) Update(c *gin.Context) {
 		if !valid {
 			return
 		}
-		commonName := strings.TrimSpace(req.CommonName)
-		if commonName == "" {
-			commonName = domain.Name
+		changed := domain.ID != row.DomainID ||
+			account.ID != row.SSLAccountID ||
+			commonName != row.CommonName ||
+			certificateNamesKey(commonName, sans) != certificateNamesKey(row.CommonName, row.SANs)
+		// 申请进行中修改域名或账号会导致订单与CSR/账号不一致，签发必然失败
+		if changed && (isCertificateApplicationActive(row.Status) || row.Status == certStatusRevoking) {
+			core.Fail(c, http.StatusBadRequest, "证书正在申请或吊销中，暂不能修改域名和SSL账号，请等待完成或使用“重新申请”后再修改")
+			return
 		}
-		updates["domain_id"] = domain.ID
-		updates["ssl_account_id"] = account.ID
-		updates["common_name"] = commonName
-		updates["sans"] = strings.TrimSpace(req.SANs)
+		if changed {
+			updates["domain_id"] = domain.ID
+			updates["ssl_account_id"] = account.ID
+			updates["common_name"] = commonName
+			updates["sans"] = sans
+			// 未完成的旧订单属于旧的域名/账号，修改后不能继续使用
+			if row.Status != certStatusIssued && row.Status != certStatusRevoked {
+				updates["provider_order_id"] = ""
+				updates["provider_certificate_id"] = ""
+				updates["provider_status"] = ""
+				updates["pending_key_pem"] = ""
+			}
+		}
 	}
 	if err := h.db.Model(&row).Updates(updates).Error; err != nil {
 		core.Fail(c, http.StatusInternalServerError, "保存证书申请失败")
@@ -199,6 +207,10 @@ func (h *CertificateHandler) Submit(c *gin.Context) {
 		return
 	}
 	if strings.EqualFold(account.Provider, "tencent_free") && row.Status == certStatusRevoking {
+		if h.certificateWorkRunning(row.ID) {
+			core.Ok(c, row)
+			return
+		}
 		ctx, err := h.contextWithSSLHTTPClient(c.Request.Context(), account)
 		if err != nil {
 			core.Fail(c, http.StatusBadRequest, err.Error())
@@ -218,59 +230,48 @@ func (h *CertificateHandler) Submit(c *gin.Context) {
 		return
 	}
 
-	if isACMEProvider(account.Provider) && row.Status == certStatusFailed && strings.TrimSpace(row.ProviderOrderID) != "" {
-		if err := h.requeueACMECertificateOrder(c.Request.Context(), &row, account); err != nil {
-			h.logCertificate(row, account, "apply", "failed", "重建ACME订单失败："+err.Error(), nil)
-			core.Fail(c, http.StatusBadRequest, "重建ACME订单失败："+err.Error())
-			return
-		}
-		h.db.First(&row, row.ID)
-		h.logCertificate(row, account, "apply", "success", "旧ACME订单已失效，已重新进入后台申请队列", nil)
-		h.enqueueCertificateApply(row.ID)
-		core.Ok(c, row)
-		return
-	}
-
+	// 失败、过期、已取消：清理旧订单与验证记录后重新申请
 	if canRequeueCertificateApplication(row.Status) {
-		if err := h.requeueCertificateApplication(c.Request.Context(), &row, account, "证书状态已终止，已重新进入后台申请队列"); err != nil {
-			h.logCertificate(row, account, "apply", "failed", "重新加入申请队列失败："+err.Error(), nil)
-			core.Fail(c, http.StatusInternalServerError, "重新加入申请队列失败："+err.Error())
-			return
-		}
-		h.db.First(&row, row.ID)
-		h.logCertificate(row, account, "apply", "success", "证书已重新进入后台申请队列", nil)
-		h.enqueueCertificateApply(row.ID)
-		core.Ok(c, row)
+		h.requeueFromRequest(c, row, account, "证书已重新进入后台申请队列")
 		return
 	}
 
 	if needsCertificateOrder(row, account) {
 		switch row.Status {
-		case certStatusQueued, certStatusApplying:
-			core.Ok(c, row)
-			return
-		case certStatusPending, certStatusFailed:
-			if err := h.db.Model(&row).Updates(map[string]any{
-				"status":              certStatusQueued,
-				"provider_status_msg": "已进入后台申请队列",
-			}).Error; err != nil {
-				core.Fail(c, http.StatusInternalServerError, "加入后台申请队列失败")
-				return
+		case certStatusQueued, certStatusPending:
+			if row.Status == certStatusPending {
+				if err := h.db.Model(&row).Updates(map[string]any{
+					"status":              certStatusQueued,
+					"provider_status_msg": "已进入后台申请队列",
+				}).Error; err != nil {
+					core.Fail(c, http.StatusInternalServerError, "加入后台申请队列失败")
+					return
+				}
+				h.db.First(&row, row.ID)
+				h.logCertificate(row, account, "apply", "success", "证书申请任务已进入后台队列", nil)
 			}
-			h.db.First(&row, row.ID)
-			h.logCertificate(row, account, "apply", "success", "证书申请任务已重新进入后台队列", nil)
 			h.enqueueCertificateApply(row.ID)
 			core.Ok(c, row)
 			return
+		case certStatusApplying:
+			core.Ok(c, row)
+			return
 		default:
-			core.Fail(c, http.StatusBadRequest, "证书申请单尚未创建，请等待后台申请完成")
+			// 处于申请中间状态却没有订单，说明数据已不一致，直接重新申请
+			h.requeueFromRequest(c, row, account, "证书申请单缺失，已重新进入后台申请队列")
 			return
 		}
 	}
 
-	if row.Status == certStatusIssued || row.Status == certStatusRevoked || row.Status == certStatusCanceled {
-		_, _ = h.refreshCertificate(c.Request.Context(), &row, account)
+	if row.Status == certStatusIssued || row.Status == certStatusRevoked {
+		h.refreshCertificateExclusive(c.Request.Context(), &row, account)
 		h.db.First(&row, row.ID)
+		core.Ok(c, row)
+		return
+	}
+
+	if h.certificateWorkRunning(row.ID) {
+		// 后台正在验证签发，避免重复提交
 		core.Ok(c, row)
 		return
 	}
@@ -280,14 +281,23 @@ func (h *CertificateHandler) Submit(c *gin.Context) {
 			core.Ok(c, row)
 			return
 		}
-		trace, err := h.submitACMECertificate(c.Request.Context(), &row, &account)
+		// 先确认旧订单仍然可用，订单失效（过期/被CA删除）时直接重新申请，避免一直卡在验证中
+		ctx, err := h.contextWithSSLHTTPClient(c.Request.Context(), account)
 		if err != nil {
-			h.logCertificate(row, account, "submit", "failed", err.Error(), trace)
-			core.Fail(c, http.StatusBadRequest, "提交ACME验证失败："+err.Error())
+			core.Fail(c, http.StatusBadRequest, err.Error())
 			return
 		}
-		h.db.First(&row, row.ID)
-		h.logCertificate(row, account, "submit", "success", "DNS验证记录已提交，等待CA验证", trace)
+		usable, reason, err := h.checkACMEOrderUsable(ctx, &row, &account)
+		if err != nil {
+			core.Fail(c, http.StatusBadRequest, "检查ACME订单状态失败："+err.Error())
+			return
+		}
+		if !usable {
+			h.logCertificate(row, account, "apply", "failed", reason+"，已自动重新申请", nil)
+			h.requeueFromRequest(c, row, account, reason+"，已重新进入后台申请队列")
+			return
+		}
+		h.logCertificate(row, account, "submit", "success", "已开始后台验证签发", nil)
 		h.startCertificateIssueFlow(row.ID, account.ID)
 		core.Ok(c, row)
 		return
@@ -309,6 +319,53 @@ func (h *CertificateHandler) Submit(c *gin.Context) {
 	core.Ok(c, row)
 }
 
+// Reset 重新申请：取消正在执行的后台任务，清理旧订单与DNS验证记录后重新进入申请队列。
+// 已签发的证书执行一次立即续期，新证书签发前旧证书内容保持不变。
+func (h *CertificateHandler) Reset(c *gin.Context) {
+	row, account, found := h.certificateAccount(c)
+	if !found {
+		return
+	}
+	if !strings.EqualFold(account.Provider, "tencent_free") && !isACMEProvider(account.Provider) {
+		core.Fail(c, http.StatusBadRequest, "当前只支持腾讯云免费证书和ACME证书重新申请")
+		return
+	}
+	if account.Status == model.StatusDisabled {
+		core.Fail(c, http.StatusBadRequest, "SSL账号已停用")
+		return
+	}
+	if row.Status == certStatusRevoking {
+		core.Fail(c, http.StatusBadRequest, "证书正在吊销中，暂不能重新申请")
+		return
+	}
+	message := "已手动重新申请，已进入后台申请队列"
+	if row.Status == certStatusIssued {
+		message = "已手动发起续期申请，新证书签发前旧证书保持不变"
+	}
+	h.requeueFromRequest(c, row, account, message)
+}
+
+// requeueFromRequest 接管证书的后台任务后重新入队，并返回最新的证书数据。
+func (h *CertificateHandler) requeueFromRequest(c *gin.Context, row model.Certificate, account model.SSLAccount, message string) {
+	workCtx, release, ok := h.takeoverCertificateWork(row.ID, certWorkCancelWait)
+	if !ok {
+		core.Fail(c, http.StatusConflict, "后台任务正在处理该证书，请稍后再试")
+		return
+	}
+	_ = h.db.First(&row, row.ID).Error
+	if err := h.requeueCertificateApplication(c.Request.Context(), &row, account, message, true); err != nil {
+		release()
+		h.logCertificate(row, account, "apply", "failed", "重新加入申请队列失败："+err.Error(), nil)
+		core.Fail(c, http.StatusInternalServerError, "重新加入申请队列失败："+err.Error())
+		return
+	}
+	h.db.First(&row, row.ID)
+	h.logCertificate(row, account, "apply", "success", message, nil)
+	// 继续持有后台任务直接开始申请，避免释放后被其他流程抢占
+	h.startCertificateApplyClaimed(workCtx, row.ID)
+	core.Ok(c, row)
+}
+
 func (h *CertificateHandler) Revoke(c *gin.Context) {
 	row, account, found := h.certificateAccount(c)
 	if !found {
@@ -319,6 +376,11 @@ func (h *CertificateHandler) Revoke(c *gin.Context) {
 		return
 	}
 	if isACMEProvider(account.Provider) {
+		if row.Status != certStatusIssued && row.Status != certStatusExpired {
+			// ACME没有“取消订单”接口：停用验证授权并清理DNS记录，相当于取消本次申请
+			h.cancelLocalApplication(c, row, account)
+			return
+		}
 		trace, err := h.revokeACMECertificate(c.Request.Context(), &row, &account)
 		if err != nil {
 			h.logCertificate(row, account, "revoke", "failed", err.Error(), trace)
@@ -329,6 +391,7 @@ func (h *CertificateHandler) Revoke(c *gin.Context) {
 			"status":              certStatusRevoked,
 			"provider_status":     "revoked",
 			"provider_status_msg": "ACME证书已吊销",
+			"next_retry_at":       nil,
 		}).Error; err != nil {
 			core.Fail(c, http.StatusInternalServerError, "保存证书状态失败")
 			return
@@ -339,7 +402,12 @@ func (h *CertificateHandler) Revoke(c *gin.Context) {
 		return
 	}
 	if strings.TrimSpace(row.ProviderCertificateID) == "" {
-		core.Fail(c, http.StatusBadRequest, "证书缺少腾讯云证书ID")
+		if row.Status == certStatusIssued || row.Status == certStatusRevoking {
+			core.Fail(c, http.StatusBadRequest, "证书缺少腾讯云证书ID")
+			return
+		}
+		// 还没有在腾讯云创建订单：直接取消本地申请
+		h.cancelLocalApplication(c, row, account)
 		return
 	}
 	ctx, err := h.contextWithSSLHTTPClient(c.Request.Context(), account)
@@ -368,17 +436,27 @@ func (h *CertificateHandler) Revoke(c *gin.Context) {
 			core.Fail(c, http.StatusBadRequest, "添加吊销DNS验证记录失败："+err.Error())
 			return
 		}
-		h.db.Model(&row).Updates(map[string]any{"status": certStatusRevoking, "provider_status_msg": "已提交吊销请求，等待域名验证"})
+		h.db.Model(&row).Updates(map[string]any{"status": certStatusRevoking, "provider_status_msg": "已提交吊销请求，等待域名验证", "next_retry_at": nil})
 		h.logCertificate(row, account, "revoke", "success", "已提交吊销请求，DNS验证记录已确认", trace)
 		h.startTencentRevokeFlow(row.ID, account.ID)
 	} else {
+		_, release, ok := h.takeoverCertificateWork(row.ID, certWorkCancelWait)
+		if !ok {
+			core.Fail(c, http.StatusConflict, "后台任务正在处理该证书，请稍后再试")
+			return
+		}
+		defer release()
+		_ = h.db.First(&row, row.ID).Error
 		trace, err := tencentSimpleCertificateAction(ctx, account, "CancelCertificateOrder", row.ProviderCertificateID)
 		if err != nil {
 			h.logCertificate(row, account, "revoke", "failed", err.Error(), traceFromError(err))
 			core.Fail(c, http.StatusBadRequest, err.Error())
 			return
 		}
-		h.db.Model(&row).Updates(map[string]any{"status": certStatusCanceled, "provider_status_msg": "已取消证书订单"})
+		if _, cleanupErr := h.cleanupAuthRecordWithMessage(ctx, &row, "certificate_cancel_cleanup", "证书订单已取消，已删除SSL验证记录", "已取消证书订单"); cleanupErr != nil {
+			h.logCertificate(row, account, "cleanup", "failed", "删除DNS验证记录失败："+cleanupErr.Error(), nil)
+		}
+		h.db.Model(&row).Updates(map[string]any{"status": certStatusCanceled, "provider_status_msg": "已取消证书订单", "next_retry_at": nil, "pending_key_pem": ""})
 		h.logCertificate(row, account, "revoke", "success", "已取消证书订单", trace)
 	}
 	h.db.First(&row, row.ID)
@@ -391,27 +469,49 @@ func (h *CertificateHandler) Detail(c *gin.Context) {
 		return
 	}
 	if shouldRefreshCertificate(row, account) && isTruthyQuery(c.Query("refresh")) {
-		trace, err := h.refreshCertificate(c.Request.Context(), &row, account)
-		if err != nil {
-			h.logCertificate(row, account, "verify", "failed", "刷新证书状态失败："+err.Error(), traceFromError(err))
+		if isCertificateIssueInProgress(row.Status) {
+			// 申请进行中：由后台任务负责验证与签发，这里只在没有后台任务时补启动一次，
+			// 避免前端轮询时在请求里同步等待DNS生效或重复提交验证。
+			if row.Status != certStatusApplying && !h.certificateWorkRunning(row.ID) {
+				h.startCertificateIssueFlow(row.ID, account.ID)
+			}
 		} else {
-			h.logCertificate(row, account, "verify", "success", verifyLogMessage(account), trace)
+			h.refreshCertificateExclusive(c.Request.Context(), &row, account)
 		}
 		h.db.First(&row, row.ID)
-		if row.Status == certStatusIssued && certificateContentNeedsRefresh(row) {
-			contentRefreshed := false
-			if err := h.downloadCertificateContent(c.Request.Context(), &row, account); err != nil {
-				h.logCertificate(row, account, "detail", "failed", "下载证书内容失败："+err.Error(), traceFromError(err))
-			} else {
-				contentRefreshed = true
-			}
-			h.db.First(&row, row.ID)
-			if contentRefreshed && !certificateContentNeedsRefresh(row) {
-				triggerCertificateAutoDeployments(h.db, row)
-			}
-		}
 	}
 	core.Ok(c, row)
+}
+
+// refreshCertificateExclusive 在没有其他后台任务处理该证书时刷新服务商状态并同步证书内容，
+// 防止与后台签发流程并发执行导致重复通知、重复自动部署。
+func (h *CertificateHandler) refreshCertificateExclusive(ctx context.Context, row *model.Certificate, account model.SSLAccount) {
+	if _, ok := h.claimCertificateWork(row.ID); !ok {
+		return
+	}
+	defer h.releaseCertificateContentWork(row.ID)
+	_ = h.db.First(row, row.ID).Error
+	trace, err := h.refreshCertificate(ctx, row, account)
+	if err != nil {
+		if h.allowProgressLog(row.ID, "refresh", err.Error()) {
+			h.logCertificate(*row, account, "verify", "failed", "刷新证书状态失败："+err.Error(), traceFromError(err))
+		}
+	} else if trace != nil && h.allowProgressLog(row.ID, "refresh_success", row.Status) {
+		h.logCertificate(*row, account, "verify", "success", verifyLogMessage(account), trace)
+	}
+	_ = h.db.First(row, row.ID).Error
+	if row.Status == certStatusIssued && certificateContentNeedsRefresh(*row) {
+		contentRefreshed := false
+		if err := h.downloadCertificateContent(ctx, row, account); err != nil {
+			h.logCertificate(*row, account, "detail", "failed", "下载证书内容失败："+err.Error(), traceFromError(err))
+		} else {
+			contentRefreshed = true
+		}
+		_ = h.db.First(row, row.ID).Error
+		if contentRefreshed && !certificateContentNeedsRefresh(*row) {
+			triggerCertificateAutoDeployments(h.db, *row)
+		}
+	}
 }
 
 func (h *CertificateHandler) startCertificateFlow(ctx context.Context, row *model.Certificate, domain model.Domain, account *model.SSLAccount) (*tencentRequestTrace, error) {
@@ -555,6 +655,11 @@ func (h *CertificateHandler) startACMECertificateFlow(ctx context.Context, row *
 	if len(names) == 0 {
 		return trace, fmt.Errorf("证书域名不能为空")
 	}
+	if err := validateCertificateNames(domain.Name, account.Provider, names); err != nil {
+		return trace, err
+	}
+	// 新私钥只写入 pending_key_pem，签发成功后才替换 key_pem；
+	// 续期失败时旧证书与旧私钥保持可用。
 	_, keyPEM, err := generateRSAPrivateKeyPEM()
 	if err != nil {
 		return trace, err
@@ -564,7 +669,28 @@ func (h *CertificateHandler) startACMECertificateFlow(ctx context.Context, row *
 	if err != nil {
 		return trace, err
 	}
+	// 订单一创建就落库，进程中途退出时也能找到订单与已创建的验证记录并清理
+	if err := h.db.Model(row).Updates(map[string]any{
+		"pending_key_pem":     keyPEM,
+		"provider_order_id":   order.URI,
+		"provider_status":     order.Status,
+		"provider_status_msg": "ACME订单已创建，正在添加DNS验证记录",
+		"verify_type":         "DNS",
+	}).Error; err != nil {
+		return trace, err
+	}
 	records := make([]acmeAuthRecord, 0, len(order.AuthzURLs))
+	saveRecords := func() error {
+		rawRecords, _ := json.Marshal(records)
+		updates := map[string]any{"auth_records": string(rawRecords)}
+		if len(records) > 0 {
+			updates["auth_record_id"] = records[0].ID
+			updates["auth_record_name"] = records[0].Name
+			updates["auth_record_value"] = records[0].Value
+			updates["auth_cleanup_status"] = "pending"
+		}
+		return h.db.Model(row).Updates(updates).Error
+	}
 	for _, authzURL := range order.AuthzURLs {
 		authz, err := client.GetAuthorization(ctx, authzURL)
 		stepTrace := acmeTrace(account.Provider, "GetAuthorization", gin.H{"authorizationUrl": authzURL}, authz, err)
@@ -595,22 +721,16 @@ func (h *CertificateHandler) startACMECertificateFlow(ctx context.Context, row *
 			AuthorizationURL: authzURL,
 			ChallengeURL:     challenge.URI,
 		})
+		if err := saveRecords(); err != nil {
+			return stepTrace, err
+		}
 	}
-	rawRecords, _ := json.Marshal(records)
+	if err := saveRecords(); err != nil {
+		return trace, err
+	}
 	updates := map[string]any{
-		"key_pem":             keyPEM,
-		"provider_order_id":   order.URI,
-		"provider_status":     order.Status,
 		"provider_status_msg": "DNS验证记录已添加",
-		"verify_type":         "DNS",
-		"auth_records":        string(rawRecords),
 		"status":              certStatusDNSAdded,
-	}
-	if len(records) > 0 {
-		updates["auth_record_id"] = records[0].ID
-		updates["auth_record_name"] = records[0].Name
-		updates["auth_record_value"] = records[0].Value
-		updates["auth_cleanup_status"] = "pending"
 	}
 	if len(records) == 0 {
 		updates["provider_status_msg"] = "域名验证已有效，等待提交签发"
@@ -662,47 +782,6 @@ func (h *CertificateHandler) ensureTencentAuthRecord(ctx context.Context, row *m
 	return trace, nil
 }
 
-func (h *CertificateHandler) requeueACMECertificateOrder(ctx context.Context, row *model.Certificate, account model.SSLAccount) error {
-	if !isACMEProvider(account.Provider) {
-		return fmt.Errorf("当前证书服务不是ACME")
-	}
-	if _, err := h.cleanupAuthRecordWithMessage(ctx, row, "acme_order_retry_cleanup", "ACME订单失效，已删除旧DNS验证记录", "旧ACME订单已失效，等待重新申请"); err != nil {
-		return err
-	}
-	updates := map[string]any{
-		"status":                  certStatusQueued,
-		"provider_certificate_id": "",
-		"provider_order_id":       "",
-		"provider_status":         "",
-		"provider_status_msg":     "旧ACME订单已失效，已进入后台重新申请队列",
-		"auth_record_id":          "",
-		"auth_record_name":        "",
-		"auth_record_value":       "",
-		"auth_records":            "",
-		"auth_cleanup_status":     "",
-	}
-	return h.db.Model(row).Updates(updates).Error
-}
-
-func (h *CertificateHandler) requeueCertificateApplication(ctx context.Context, row *model.Certificate, account model.SSLAccount, message string) error {
-	if _, err := h.cleanupAuthRecordWithMessage(ctx, row, "certificate_requeue_cleanup", "证书重新申请，已删除旧DNS验证记录", message); err != nil {
-		core.LogSystem(h.db, "worker", "certificate", "warning", "certificate_requeue_cleanup", "failed", "证书重新申请前清理旧DNS验证记录失败，继续重新申请", gin.H{"certificateId": row.ID, "error": err.Error()})
-	}
-	updates := map[string]any{
-		"status":                  certStatusQueued,
-		"provider_certificate_id": "",
-		"provider_order_id":       "",
-		"provider_status":         "",
-		"provider_status_msg":     message,
-		"auth_record_id":          "",
-		"auth_record_name":        "",
-		"auth_record_value":       "",
-		"auth_records":            "",
-		"auth_cleanup_status":     "",
-	}
-	return h.db.Model(row).Updates(updates).Error
-}
-
 func (h *CertificateHandler) waitTencentDVDetail(ctx context.Context, account model.SSLAccount, certificateID string) (*tencentDetail, *tencentRequestTrace, error) {
 	var lastErr error
 	var lastTrace *tencentRequestTrace
@@ -724,37 +803,48 @@ func (h *CertificateHandler) waitTencentDVDetail(ctx context.Context, account mo
 }
 
 func (h *CertificateHandler) startCertificateIssueFlow(rowID uint, accountID uint) {
-	if !h.claimCertificateContentWork(rowID) {
+	ctx, ok := h.claimCertificateWork(rowID)
+	if !ok {
 		return
 	}
 	go func() {
 		defer h.releaseCertificateContentWork(rowID)
-		var row model.Certificate
-		var account model.SSLAccount
-		var taskLog *model.TaskLog
-		if h.db.First(&row, rowID).Error == nil {
-			taskLog = h.startTaskLog("后台证书验证签发", "certificate_issue", row)
-		}
-		if err := h.runCertificateIssueFlow(context.Background(), rowID, accountID); err != nil {
-			if row.ID == 0 {
-				_ = h.db.First(&row, rowID).Error
-			}
-			if h.db.First(&account, accountID).Error == nil {
-				h.logCertificate(row, account, "verify", "failed", "证书自动验证流程失败："+err.Error(), nil)
-			}
+		h.runCertificateIssueTask(ctx, rowID, accountID)
+	}()
+}
+
+// runCertificateIssueTask 执行后台验证签发并记录任务日志，调用方需已持有该证书的后台任务。
+func (h *CertificateHandler) runCertificateIssueTask(ctx context.Context, rowID uint, accountID uint) {
+	var row model.Certificate
+	var account model.SSLAccount
+	var taskLog *model.TaskLog
+	if h.db.First(&row, rowID).Error == nil {
+		taskLog = h.startTaskLog("后台证书验证签发", "certificate_issue", row)
+	}
+	if err := h.runCertificateIssueFlow(ctx, rowID, accountID); err != nil {
+		if ctx.Err() != nil {
+			// 被“重新申请/删除/取消”主动中断，不记为失败
 			if taskLog != nil {
-				h.finishTaskLog(taskLog, "failed", err.Error(), taskLogDetail(row, &account, "issue_failed"))
+				h.finishTaskLog(taskLog, "success", "后台验证签发已被中断", taskLogDetail(row, nil, "issue_canceled"))
 			}
 			return
 		}
-		if taskLog != nil {
-			_ = h.db.First(&row, rowID).Error
-			if account.ID == 0 {
-				_ = h.db.First(&account, accountID).Error
-			}
-			h.finishTaskLog(taskLog, "success", "证书后台验证签发流程已完成", taskLogDetail(row, &account, "issue_success"))
+		_ = h.db.First(&row, rowID).Error
+		if h.db.First(&account, accountID).Error == nil && h.allowProgressLog(rowID, "issue_flow", err.Error()) {
+			h.logCertificate(row, account, "verify", "failed", "证书自动验证流程未完成："+err.Error(), nil)
 		}
-	}()
+		if taskLog != nil {
+			h.finishTaskLog(taskLog, "failed", err.Error(), taskLogDetail(row, &account, "issue_failed"))
+		}
+		return
+	}
+	if taskLog != nil {
+		_ = h.db.First(&row, rowID).Error
+		if account.ID == 0 {
+			_ = h.db.First(&account, accountID).Error
+		}
+		h.finishTaskLog(taskLog, "success", "证书后台验证签发流程已完成", taskLogDetail(row, &account, "issue_success"))
+	}
 }
 
 func (h *CertificateHandler) startCertificateApplyWorker() {
@@ -763,6 +853,8 @@ func (h *CertificateHandler) startCertificateApplyWorker() {
 		interval := systemtask.Interval(h.db, systemtask.CertificateApplyQueueTaskKey)
 		core.LogSystem(h.db, "monitor", "certificate", "info", "certificate_apply_worker_start", "success", "证书申请后台监控已启动", gin.H{"intervalSeconds": int(interval.Seconds())})
 		for {
+			h.recoverStaleApplying()
+			h.scanCertificateRetry()
 			h.scanCertificateApplyQueue()
 			h.scanCertificateIssueProgress()
 			time.Sleep(systemtask.Interval(h.db, systemtask.CertificateApplyQueueTaskKey))
@@ -824,7 +916,8 @@ func (h *CertificateHandler) scanCertificateContentSync() {
 }
 
 func (h *CertificateHandler) enqueueCertificateContentSync(rowID, accountID uint) {
-	if !h.claimCertificateContentWork(rowID) {
+	ctx, ok := h.claimCertificateWork(rowID)
+	if !ok {
 		return
 	}
 	go func() {
@@ -837,8 +930,10 @@ func (h *CertificateHandler) enqueueCertificateContentSync(rowID, accountID uint
 		if err := h.db.First(&account, accountID).Error; err != nil {
 			return
 		}
-		if err := h.downloadCertificateContent(context.Background(), &row, account); err != nil {
-			core.LogSystem(h.db, "worker", "certificate", "error", "certificate_content_sync", "failed", "同步证书本地内容失败", gin.H{"certificateId": row.ID, "error": err.Error()})
+		if err := h.downloadCertificateContent(ctx, &row, account); err != nil {
+			if ctx.Err() == nil && h.allowProgressLog(rowID, "content_sync", err.Error()) {
+				core.LogSystem(h.db, "worker", "certificate", "error", "certificate_content_sync", "failed", "同步证书本地内容失败", gin.H{"certificateId": row.ID, "error": err.Error()})
+			}
 			return
 		}
 		if err := h.db.First(&row, row.ID).Error; err != nil {
@@ -853,25 +948,6 @@ func (h *CertificateHandler) enqueueCertificateContentSync(rowID, accountID uint
 	}()
 }
 
-func (h *CertificateHandler) claimCertificateContentWork(rowID uint) bool {
-	h.contentSyncMu.Lock()
-	defer h.contentSyncMu.Unlock()
-	if h.contentSyncInFlight == nil {
-		h.contentSyncInFlight = map[uint]struct{}{}
-	}
-	if _, exists := h.contentSyncInFlight[rowID]; exists {
-		return false
-	}
-	h.contentSyncInFlight[rowID] = struct{}{}
-	return true
-}
-
-func (h *CertificateHandler) releaseCertificateContentWork(rowID uint) {
-	h.contentSyncMu.Lock()
-	delete(h.contentSyncInFlight, rowID)
-	h.contentSyncMu.Unlock()
-}
-
 func (h *CertificateHandler) scanCertificateApplyQueue() {
 	var rows []model.Certificate
 	err := h.db.
@@ -883,15 +959,18 @@ func (h *CertificateHandler) scanCertificateApplyQueue() {
 		core.LogSystem(h.db, "monitor", "certificate", "error", "certificate_apply_queue_scan", "failed", "扫描证书申请任务失败", gin.H{"error": err.Error()})
 		return
 	}
-	if len(rows) > 0 {
-		ids := make([]uint, 0, len(rows))
-		for _, row := range rows {
-			ids = append(ids, row.ID)
-		}
-		core.LogSystem(h.db, "monitor", "certificate", "info", "certificate_apply_queue_scan", "success", "发现待申请证书任务", gin.H{"count": len(rows), "certificateIds": ids})
-	}
+	ids := make([]uint, 0, len(rows))
 	for _, row := range rows {
-		h.enqueueCertificateApply(row.ID)
+		if h.certificateWorkRunning(row.ID) {
+			continue
+		}
+		ids = append(ids, row.ID)
+	}
+	if len(ids) > 0 {
+		core.LogSystem(h.db, "monitor", "certificate", "info", "certificate_apply_queue_scan", "success", "发现待申请证书任务", gin.H{"count": len(ids), "certificateIds": ids})
+	}
+	for _, id := range ids {
+		h.enqueueCertificateApply(id)
 	}
 }
 
@@ -905,6 +984,9 @@ func (h *CertificateHandler) scanCertificateIssueProgress() {
 		return
 	}
 	for _, row := range rows {
+		if h.certificateWorkRunning(row.ID) {
+			continue
+		}
 		var account model.SSLAccount
 		if err := h.db.First(&account, row.SSLAccountID).Error; err != nil || account.Status == model.StatusDisabled {
 			continue
@@ -912,12 +994,24 @@ func (h *CertificateHandler) scanCertificateIssueProgress() {
 		if !strings.EqualFold(account.Provider, "tencent_free") && !isACMEProvider(account.Provider) {
 			continue
 		}
+		// ACME 的 applying 表示订单创建/添加DNS记录途中，由 recoverStaleApplying 处理中断
+		if isACMEProvider(account.Provider) && row.Status == certStatusApplying {
+			continue
+		}
+		if row.ApplyStartedAt == nil {
+			now := time.Now()
+			_ = h.db.Model(&model.Certificate{}).Where("id = ? AND apply_started_at IS NULL", row.ID).Update("apply_started_at", &now).Error
+		} else if time.Since(*row.ApplyStartedAt) > certIssueDeadline {
+			h.failTimedOutCertificate(row, account)
+			continue
+		}
 		h.enqueueCertificateIssueProgress(row.ID, account.ID)
 	}
 }
 
 func (h *CertificateHandler) enqueueCertificateIssueProgress(rowID, accountID uint) {
-	if !h.claimCertificateContentWork(rowID) {
+	ctx, ok := h.claimCertificateWork(rowID)
+	if !ok {
 		return
 	}
 	go func() {
@@ -930,29 +1024,48 @@ func (h *CertificateHandler) enqueueCertificateIssueProgress(rowID, accountID ui
 		if err := h.db.First(&account, accountID).Error; err != nil {
 			return
 		}
-		ctx := context.Background()
+		logErr := func(message string, err error) {
+			if ctx.Err() != nil || !h.allowProgressLog(rowID, "issue_progress", err.Error()) {
+				return
+			}
+			core.LogSystem(h.db, "worker", "certificate", "error", "certificate_issue_progress", "failed", message, gin.H{"certificateId": row.ID, "error": err.Error()})
+		}
 		if strings.EqualFold(account.Provider, "tencent_free") {
+			sslCtx, err := h.contextWithSSLHTTPClient(ctx, account)
+			if err != nil {
+				logErr("恢复腾讯云证书签发流程失败", err)
+				return
+			}
 			if row.Status == certStatusApplying && strings.TrimSpace(row.AuthRecordID) == "" {
-				if _, err := h.ensureTencentAuthRecord(ctx, &row, account); err != nil {
-					core.LogSystem(h.db, "worker", "certificate", "error", "certificate_issue_progress", "failed", "恢复腾讯云证书DNS验证记录失败", gin.H{"certificateId": row.ID, "error": err.Error()})
+				if _, err := h.ensureTencentAuthRecord(sslCtx, &row, account); err != nil {
+					logErr("恢复腾讯云证书DNS验证记录失败", err)
 					return
 				}
 				_ = h.db.First(&row, row.ID).Error
 			}
-			if _, err := h.refreshTencentCertificate(ctx, &row, account); err != nil {
-				core.LogSystem(h.db, "worker", "certificate", "error", "certificate_issue_progress", "failed", "刷新腾讯云证书签发进度失败", gin.H{"certificateId": row.ID, "error": err.Error()})
+			if _, err := h.refreshTencentCertificate(sslCtx, &row, account); err != nil {
+				logErr("刷新腾讯云证书签发进度失败", err)
 				return
 			}
 			_ = h.db.First(&row, row.ID).Error
+			if row.Status == certStatusFailed {
+				h.markCertificateFailed(&row, account, firstNonEmpty(row.ProviderStatusMsg, "腾讯云证书申请失败"), nil)
+				return
+			}
 			if row.Status == certStatusDNSAdded || row.Status == certStatusApplying {
-				if err := h.runTencentIssueFlow(ctx, &row, account); err != nil {
-					core.LogSystem(h.db, "worker", "certificate", "error", "certificate_issue_progress", "failed", "恢复腾讯云证书签发流程失败", gin.H{"certificateId": row.ID, "error": err.Error()})
+				if err := h.runTencentIssueFlow(sslCtx, &row, account); err != nil {
+					logErr("恢复腾讯云证书签发流程未完成", err)
 				}
 			}
 			return
 		}
-		if _, err := h.refreshACMECertificate(ctx, &row, &account); err != nil {
-			core.LogSystem(h.db, "worker", "certificate", "error", "certificate_issue_progress", "failed", "恢复ACME证书签发流程失败", gin.H{"certificateId": row.ID, "error": err.Error()})
+		sslCtx, err := h.contextWithSSLHTTPClient(ctx, account)
+		if err != nil {
+			logErr("恢复ACME证书签发流程失败", err)
+			return
+		}
+		if _, err := h.refreshACMECertificate(sslCtx, &row, &account); err != nil {
+			logErr("恢复ACME证书签发流程未完成", err)
 		}
 	}()
 }
@@ -961,12 +1074,20 @@ func isCertificateIssueInProgress(status string) bool {
 	return status == certStatusApplying || status == certStatusDNSAdded || status == certStatusSubmitted
 }
 
+// isCertificateApplicationActive 申请流程是否正在进行（含排队）
+func isCertificateApplicationActive(status string) bool {
+	return status == certStatusQueued || isCertificateIssueInProgress(status)
+}
+
 func (h *CertificateHandler) scanCertificateExpiry() {
 	var rows []model.Certificate
+	// 只对已签发的证书自动续期：
+	// - 失败的申请由 scanCertificateRetry 按退避时间重试，不在这里每轮重复下单；
+	//   旧版本遗留的失败证书（从未安排过重试）在这里补一次续期，之后同样走退避重试；
+	// - 已取消/已过期（多为从服务商导入的历史证书）不自动重新申请，需要时手动“重新申请”。
 	err := h.db.
-		Where("status IN ? AND expires_at IS NOT NULL", []string{certStatusIssued, certStatusFailed, certStatusExpired, certStatusCanceled}).
+		Where(renewableCertificateCondition+" AND expires_at IS NOT NULL", certStatusIssued, certStatusFailed).
 		Order("expires_at ASC").
-		Limit(200).
 		Find(&rows).Error
 	if err != nil {
 		core.LogSystem(h.db, "monitor", "certificate", "error", "certificate_expiry_scan", "failed", "扫描证书到期任务失败", gin.H{"error": err.Error()})
@@ -1007,22 +1128,21 @@ func (h *CertificateHandler) scanCertificateExpiry() {
 	}
 }
 
+// renewableCertificateCondition 可自动续期：已签发，或旧版本遗留的、从未安排过重试的失败证书。
+const renewableCertificateCondition = "(status = ? OR (status = ? AND retry_count = 0 AND next_retry_at IS NULL))"
+
 func (h *CertificateHandler) enqueueCertificateRenewal(row model.Certificate, account model.SSLAccount, renewBeforeDay int) bool {
-	updates := map[string]any{
-		"status":                  certStatusQueued,
-		"provider_certificate_id": "",
-		"provider_order_id":       "",
-		"provider_status":         "",
-		"provider_status_msg":     "证书即将到期，已进入自动续期申请队列",
-		"auth_record_id":          "",
-		"auth_record_name":        "",
-		"auth_record_value":       "",
-		"auth_records":            "",
-		"auth_cleanup_status":     "",
+	if _, ok := h.claimCertificateWork(row.ID); !ok {
+		return false
 	}
+	message := "证书即将到期，已进入自动续期申请队列"
+	updates := certificateRequeueUpdates(message)
+	updates["retry_count"] = 0
+	// 只清理订单信息，cert_pem/key_pem 保留旧证书，续期签发成功前旧证书仍可部署
 	result := h.db.Model(&model.Certificate{}).
-		Where("id = ? AND status IN ?", row.ID, []string{certStatusIssued, certStatusFailed, certStatusExpired, certStatusCanceled}).
+		Where("id = ? AND "+renewableCertificateCondition, row.ID, certStatusIssued, certStatusFailed).
 		Updates(updates)
+	h.releaseCertificateContentWork(row.ID)
 	if result.Error != nil {
 		core.LogSystem(h.db, "monitor", "certificate", "error", "certificate_expiry_enqueue", "failed", "证书续期加入队列失败", gin.H{"certificateId": row.ID, "error": result.Error.Error()})
 		return false
@@ -1031,103 +1151,118 @@ func (h *CertificateHandler) enqueueCertificateRenewal(row model.Certificate, ac
 		return false
 	}
 	row.Status = certStatusQueued
-	row.ProviderStatusMsg = "证书即将到期，已进入自动续期申请队列"
+	row.ProviderStatusMsg = message
 	h.logCertificate(row, account, "apply", "success", fmt.Sprintf("证书即将到期，已自动加入续期申请队列（提前 %d 天）", renewBeforeDay), nil)
 	h.enqueueCertificateApply(row.ID)
 	return true
 }
 
 func (h *CertificateHandler) enqueueCertificateApply(rowID uint) {
-	h.applyMu.Lock()
-	if _, ok := h.applyInFlight[rowID]; ok {
-		h.applyMu.Unlock()
-		core.LogSystem(h.db, "monitor", "certificate", "warning", "certificate_apply_enqueue_skip", "success", "证书申请任务已在执行中，跳过重复入队", gin.H{"certificateId": rowID})
+	ctx, ok := h.claimCertificateWork(rowID)
+	if !ok {
+		core.LogSystem(h.db, "monitor", "certificate", "warning", "certificate_apply_enqueue_skip", "success", "证书已有后台任务在执行，跳过重复入队", gin.H{"certificateId": rowID})
 		return
 	}
-	h.applyInFlight[rowID] = struct{}{}
-	h.applyMu.Unlock()
+	h.startCertificateApplyClaimed(ctx, rowID)
+}
+
+// startCertificateApplyClaimed 在调用方已占用的后台任务中执行申请与签发，结束后释放占用。
+func (h *CertificateHandler) startCertificateApplyClaimed(ctx context.Context, rowID uint) {
 	core.LogSystem(h.db, "monitor", "certificate", "info", "certificate_apply_enqueue", "success", "证书申请任务已进入后台执行队列", gin.H{"certificateId": rowID})
 
 	go func() {
-		defer func() {
-			h.applyMu.Lock()
-			delete(h.applyInFlight, rowID)
-			h.applyMu.Unlock()
-		}()
-		if err := h.runCertificateApplyFlow(context.Background(), rowID); err != nil {
-			core.LogSystem(h.db, "worker", "certificate", "error", "certificate_apply_execute", "failed", "证书后台申请执行失败", gin.H{"certificateId": rowID, "error": err.Error()})
+		defer h.releaseCertificateContentWork(rowID)
+		started, accountID, err := h.runCertificateApplyFlow(ctx, rowID)
+		if err != nil {
+			if ctx.Err() == nil {
+				core.LogSystem(h.db, "worker", "certificate", "error", "certificate_apply_execute", "failed", "证书后台申请执行失败", gin.H{"certificateId": rowID, "error": err.Error()})
+			}
 			return
 		}
 		core.LogSystem(h.db, "worker", "certificate", "info", "certificate_apply_execute", "success", "证书后台申请执行完成", gin.H{"certificateId": rowID})
+		if started {
+			// 继续持有同一个后台任务执行验证签发，避免与扫描任务并发处理同一张证书
+			h.runCertificateIssueTask(ctx, rowID, accountID)
+		}
 	}()
 }
 
-func (h *CertificateHandler) runCertificateApplyFlow(ctx context.Context, rowID uint) error {
+// runCertificateApplyFlow 创建证书订单并添加DNS验证记录。调用方需已持有该证书的后台任务。
+// 返回值 started 表示订单已创建、需要继续执行验证签发。
+func (h *CertificateHandler) runCertificateApplyFlow(ctx context.Context, rowID uint) (bool, uint, error) {
 	var row model.Certificate
 	if err := h.db.First(&row, rowID).Error; err != nil {
-		return err
+		return false, 0, err
 	}
 	taskLog := h.startTaskLog("后台证书申请", "certificate_apply", row)
 	if strings.TrimSpace(row.ProviderOrderID) != "" || strings.TrimSpace(row.ProviderCertificateID) != "" {
 		h.finishTaskLog(taskLog, "success", "证书申请单已存在，跳过重复申请", taskLogDetail(row, nil, "skip_existing_order"))
-		return nil
+		return false, 0, nil
 	}
 	if row.Status != certStatusQueued && row.Status != certStatusPending {
 		h.finishTaskLog(taskLog, "success", "证书状态无需后台申请，已跳过", taskLogDetail(row, nil, "skip_status"))
-		return nil
+		return false, 0, nil
 	}
+	now := time.Now()
 	claimed := h.db.Model(&model.Certificate{}).
 		Where("id = ? AND status IN ? AND provider_order_id = ? AND provider_certificate_id = ?", rowID, []string{certStatusQueued, certStatusPending}, "", "").
 		Updates(map[string]any{
 			"status":              certStatusApplying,
 			"provider_status_msg": "后台正在创建证书申请单",
+			"apply_started_at":    &now,
+			"next_retry_at":       nil,
 		})
 	if claimed.Error != nil {
 		h.finishTaskLog(taskLog, "failed", claimed.Error.Error(), taskLogDetail(row, nil, "claim_failed"))
-		return claimed.Error
+		return false, 0, claimed.Error
 	}
 	if claimed.RowsAffected == 0 {
 		h.finishTaskLog(taskLog, "success", "任务已被其他后台流程接管", taskLogDetail(row, nil, "already_claimed"))
-		return nil
+		return false, 0, nil
 	}
 	if err := h.db.First(&row, rowID).Error; err != nil {
 		h.finishTaskLog(taskLog, "failed", err.Error(), taskLogDetail(row, nil, "reload_failed"))
-		return err
+		return false, 0, err
 	}
 
 	var account model.SSLAccount
 	if err := h.db.First(&account, row.SSLAccountID).Error; err != nil {
-		h.failCertificateApply(row, account, "SSL账号不存在："+err.Error(), nil)
+		h.failCertificateApply(&row, account, "SSL账号不存在："+err.Error(), nil)
 		h.finishTaskLog(taskLog, "failed", "SSL账号不存在："+err.Error(), taskLogDetail(row, nil, "account_not_found"))
-		return err
+		return false, 0, err
+	}
+	if account.Status == model.StatusDisabled {
+		err := fmt.Errorf("SSL账号已停用")
+		h.failCertificateApply(&row, account, err.Error(), nil)
+		h.finishTaskLog(taskLog, "failed", err.Error(), taskLogDetail(row, &account, "account_disabled"))
+		return false, 0, err
 	}
 	domain, err := h.resolveCertificateDomain(&row, row.CommonName)
 	if err != nil {
-		h.failCertificateApply(row, account, "域名不存在："+err.Error(), nil)
+		h.failCertificateApply(&row, account, "域名不存在："+err.Error(), nil)
 		h.finishTaskLog(taskLog, "failed", "域名不存在："+err.Error(), taskLogDetail(row, &account, "domain_not_found"))
-		return err
+		return false, 0, err
 	}
 	trace, err := h.startCertificateFlow(ctx, &row, domain, &account)
 	if err != nil {
-		h.failCertificateApply(row, account, err.Error(), trace)
+		if ctx.Err() != nil {
+			// 被重新申请/删除中断：接管方会负责清理与重置状态
+			h.finishTaskLog(taskLog, "success", "证书申请已被中断", taskLogDetail(row, &account, "apply_canceled"))
+			return false, 0, ctx.Err()
+		}
+		_ = h.db.First(&row, row.ID).Error
+		h.failCertificateApply(&row, account, err.Error(), trace)
 		h.finishTaskLog(taskLog, "failed", err.Error(), taskLogDetail(row, &account, "apply_failed"))
-		return err
+		return false, 0, err
 	}
 	h.db.First(&row, row.ID)
 	h.logCertificate(row, account, "apply", "success", "证书申请已创建，DNS验证记录已添加", trace)
 	h.finishTaskLog(taskLog, "success", "证书申请已创建，DNS验证记录已添加", taskLogDetail(row, &account, "apply_success"))
-	h.startCertificateIssueFlow(row.ID, account.ID)
-	return nil
+	return true, account.ID, nil
 }
 
-func (h *CertificateHandler) failCertificateApply(row model.Certificate, account model.SSLAccount, message string, trace *tencentRequestTrace) {
-	_ = h.db.Model(&row).Updates(map[string]any{
-		"status":              certStatusFailed,
-		"provider_status_msg": message,
-	}).Error
-	if account.ID > 0 {
-		h.logCertificate(row, account, "apply", "failed", message, trace)
-	}
+func (h *CertificateHandler) failCertificateApply(row *model.Certificate, account model.SSLAccount, message string, trace *tencentRequestTrace) {
+	h.markCertificateFailed(row, account, message, trace)
 }
 
 func (h *CertificateHandler) runCertificateIssueFlow(ctx context.Context, rowID uint, accountID uint) error {
@@ -1138,6 +1273,9 @@ func (h *CertificateHandler) runCertificateIssueFlow(ctx context.Context, rowID 
 	var account model.SSLAccount
 	if err := h.db.First(&account, accountID).Error; err != nil {
 		return err
+	}
+	if !isCertificateIssueInProgress(row.Status) {
+		return nil
 	}
 	ctx, err := h.contextWithSSLHTTPClient(ctx, account)
 	if err != nil {
@@ -1158,58 +1296,75 @@ func (h *CertificateHandler) runTencentIssueFlow(ctx context.Context, row *model
 	}
 	trace, err := tencentCompleteCertificate(ctx, account, row.ProviderCertificateID)
 	if err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		h.logCertificate(*row, account, "verify", "failed", "主动触发域名验证失败："+err.Error(), traceFromError(err))
 		return err
 	}
 	h.logCertificate(*row, account, "verify", "success", "已主动触发域名验证", trace)
 
+	throttle := newFlowLogThrottle()
 	verified := false
-	for i := 0; i < certFlowMaxChecks; i++ {
-		if i > 0 {
-			time.Sleep(certFlowInterval)
-		}
+	err = pollCertificateFlow(ctx, func() (bool, error) {
 		results, trace, err := tencentCheckCertificateDomainVerification(ctx, account, row.ProviderCertificateID)
 		if err != nil {
-			h.logCertificate(*row, account, "verify", "failed", "检查域名验证失败："+err.Error(), traceFromError(err))
-			continue
+			if ctx.Err() == nil && throttle.allow("check_failed:"+err.Error()) {
+				h.logCertificate(*row, account, "verify", "failed", "检查域名验证失败："+err.Error(), traceFromError(err))
+			}
+			return false, nil
 		}
 		if tencentVerificationPassed(results) {
 			h.logCertificate(*row, account, "verify", "success", "域名验证已通过", trace)
 			verified = true
-			break
+			return true, nil
 		}
-		h.logCertificate(*row, account, "verify", "success", "域名验证暂未生效，继续等待", trace)
+		if throttle.allow("waiting") {
+			h.logCertificate(*row, account, "verify", "success", "域名验证暂未生效，继续等待", trace)
+		}
+		return false, nil
+	})
+	if err != nil {
+		return err
 	}
 	if !verified {
-		_ = h.db.Model(row).Updates(map[string]any{"provider_status_msg": "域名验证暂未生效，请稍后查看日志"})
+		_ = h.db.Model(row).Updates(map[string]any{"provider_status_msg": "域名验证暂未生效，后台将继续检查"}).Error
 		return fmt.Errorf("域名验证暂未生效")
 	}
 
-	for i := 0; i < certFlowMaxChecks; i++ {
-		if i > 0 {
-			time.Sleep(certFlowInterval)
-		}
+	var issueErr error
+	done := false
+	err = pollCertificateFlow(ctx, func() (bool, error) {
 		detail, trace, err := tencentDescribeCertificate(ctx, account, row.ProviderCertificateID)
 		if err != nil {
-			h.logCertificate(*row, account, "verify", "failed", "检查签发状态失败："+err.Error(), traceFromError(err))
-			continue
+			if ctx.Err() == nil && throttle.allow("status_failed:"+err.Error()) {
+				h.logCertificate(*row, account, "verify", "failed", "检查签发状态失败："+err.Error(), traceFromError(err))
+			}
+			return false, nil
 		}
+		previousStatus := row.Status
 		if detail != nil {
 			h.applyTencentDetail(row, detail)
 			_ = h.db.First(row, row.ID).Error
 		}
-		h.logCertificate(*row, account, "verify", "success", "已检查签发状态", trace)
+		if row.Status != previousStatus || throttle.allow("status_checked") {
+			h.logCertificate(*row, account, "verify", "success", "已检查签发状态", trace)
+		}
 		switch row.Status {
 		case certStatusIssued:
+			done = true
 			if err := h.downloadTencentCertificate(ctx, row, account); err != nil {
 				h.logCertificate(*row, account, "detail", "failed", "下载新证书内容失败："+err.Error(), traceFromError(err))
-				return fmt.Errorf("下载新证书内容失败：%w", err)
+				issueErr = fmt.Errorf("下载新证书内容失败：%w", err)
+				return true, nil
 			}
 			if err := h.db.First(row, row.ID).Error; err != nil {
-				return err
+				issueErr = err
+				return true, nil
 			}
 			if certificateContentNeedsRefresh(*row) {
-				return fmt.Errorf("新证书内容校验失败，已停止自动部署")
+				issueErr = fmt.Errorf("新证书内容校验失败，已停止自动部署")
+				return true, nil
 			}
 			cleaned, err := h.cleanupAuthRecord(ctx, row)
 			if err != nil {
@@ -1219,12 +1374,24 @@ func (h *CertificateHandler) runTencentIssueFlow(ctx context.Context, row *model
 			}
 			h.notifyCertificateIssued(*row)
 			triggerCertificateAutoDeployments(h.db, *row)
-			return nil
+			return true, nil
 		case certStatusFailed, certStatusExpired, certStatusCanceled, certStatusRevoked:
-			return fmt.Errorf("证书签发进入终止状态：%s", row.Status)
+			done = true
+			h.markCertificateFailed(row, account, "证书签发进入终止状态："+firstNonEmpty(row.ProviderStatusMsg, row.Status), nil)
+			return true, nil
 		}
+		return false, nil
+	})
+	if err != nil {
+		return err
 	}
-	return fmt.Errorf("签发状态仍在处理中")
+	if issueErr != nil {
+		return issueErr
+	}
+	if !done {
+		return fmt.Errorf("签发状态仍在处理中，后台将继续检查")
+	}
+	return nil
 }
 
 func (h *CertificateHandler) runACMEIssueFlow(ctx context.Context, row *model.Certificate, account *model.SSLAccount) error {
@@ -1232,44 +1399,76 @@ func (h *CertificateHandler) runACMEIssueFlow(ctx context.Context, row *model.Ce
 	if err != nil {
 		return err
 	}
-	submitTrace, err := h.submitACMECertificate(ctx, row, account)
+	// 订单可能已过期或被CA删除，先确认订单可用，否则直接标记失败并按退避重试，避免一直卡在验证中
+	usable, reason, err := h.checkACMEOrderUsable(ctx, row, account)
+	if err != nil {
+		return err
+	}
+	if !usable {
+		h.markCertificateFailed(row, *account, reason, nil)
+		return nil
+	}
+	submitTrace, accepted, err := h.submitACMECertificate(ctx, row, account)
 	if submitTrace != nil {
 		trace = submitTrace
 	}
 	if err != nil {
-		return err
-	}
-	h.logCertificate(*row, *account, "submit", "success", "已提交ACME DNS验证，等待生效", trace)
-	if err := h.waitACMEAuthorizations(ctx, row, account, client); err != nil {
-		return err
-	}
-	for i := 0; i < certFlowMaxChecks; i++ {
-		if i > 0 {
-			time.Sleep(certFlowInterval)
+		if errors.Is(err, errACMEChallengeInvalid) {
+			h.markCertificateFailed(row, *account, err.Error(), trace)
+			return nil
 		}
+		return err
+	}
+	if accepted {
+		h.logCertificate(*row, *account, "submit", "success", "已提交ACME DNS验证，等待生效", trace)
+	}
+	if err := h.waitACMEAuthorizations(ctx, row, account, client); err != nil {
+		if errors.Is(err, errACMEAuthorizationInvalid) {
+			h.markCertificateFailed(row, *account, err.Error(), nil)
+			return nil
+		}
+		return err
+	}
+	throttle := newFlowLogThrottle()
+	var issueErr error
+	done := false
+	err = pollCertificateFlow(ctx, func() (bool, error) {
 		order, err := client.GetOrder(ctx, row.ProviderOrderID)
 		trace = acmeTrace(account.Provider, "GetOrder", gin.H{"orderUrl": row.ProviderOrderID}, order, err)
 		if err != nil {
-			h.logCertificate(*row, *account, "verify", "failed", "检查ACME签发状态失败："+err.Error(), trace)
-			continue
+			if isACMEOrderUnusable(err) {
+				done = true
+				h.markCertificateFailed(row, *account, "ACME订单已失效或不存在："+err.Error(), trace)
+				return true, nil
+			}
+			if ctx.Err() == nil && throttle.allow("get_order:"+err.Error()) {
+				h.logCertificate(*row, *account, "verify", "failed", "检查ACME签发状态失败："+err.Error(), trace)
+			}
+			return false, nil
 		}
-		h.logCertificate(*row, *account, "verify", "success", "已检查ACME签发状态", trace)
+		if throttle.allow("order:" + order.Status) {
+			h.logCertificate(*row, *account, "verify", "success", "已检查ACME签发状态："+order.Status, trace)
+		}
 		if order.Status == acme.StatusReady {
 			if err := h.finalizeACMECertificate(ctx, row, account, client, order); err != nil {
-				return err
+				issueErr = err
+				return true, nil
 			}
 			_ = h.db.First(row, row.ID).Error
 		}
 		if order.Status == acme.StatusValid || row.Status == certStatusIssued {
+			done = true
 			certURL := firstNonEmpty(order.CertURL, row.ProviderCertificateID)
 			if certURL != "" && (order.Status == acme.StatusValid || certificateContentNeedsRefresh(*row)) {
 				if err := h.fetchACMECertificate(ctx, row, account, client, certURL); err != nil {
-					return err
+					issueErr = err
+					return true, nil
 				}
 				_ = h.db.First(row, row.ID).Error
 			}
 			if certificateContentNeedsRefresh(*row) {
-				return fmt.Errorf("新证书内容校验失败，已停止自动部署")
+				issueErr = fmt.Errorf("新证书内容校验失败，已停止自动部署")
+				return true, nil
 			}
 			cleaned, err := h.cleanupAuthRecord(ctx, row)
 			if err != nil {
@@ -1279,50 +1478,95 @@ func (h *CertificateHandler) runACMEIssueFlow(ctx context.Context, row *model.Ce
 			}
 			h.notifyCertificateIssued(*row)
 			triggerCertificateAutoDeployments(h.db, *row)
-			return nil
+			return true, nil
 		}
 		if order.Status == acme.StatusInvalid {
-			return fmt.Errorf("ACME订单无效")
+			done = true
+			h.markCertificateFailed(row, *account, "ACME订单无效"+acmeOrderErrorDetail(order), trace)
+			return true, nil
 		}
+		return false, nil
+	})
+	if err != nil {
+		return err
 	}
-	return fmt.Errorf("ACME签发状态仍在处理中")
+	if issueErr != nil {
+		return issueErr
+	}
+	if !done {
+		return fmt.Errorf("ACME签发状态仍在处理中，后台将继续检查")
+	}
+	return nil
 }
+
+var (
+	errACMEAuthorizationInvalid = errors.New("ACME域名验证失败")
+	errACMEChallengeInvalid     = errors.New("ACME DNS验证已失效")
+)
 
 func (h *CertificateHandler) waitACMEAuthorizations(ctx context.Context, row *model.Certificate, account *model.SSLAccount, client *acme.Client) error {
 	records := parseACMEAuthRecords(row.AuthRecords)
-	for i := 0; i < certFlowMaxChecks; i++ {
-		if i > 0 {
-			time.Sleep(certFlowInterval)
-		}
-		allValid := len(records) > 0
+	if len(records) == 0 {
+		// 所有授权在下单时已有效（CA复用了近期的验证结果），无需等待，直接检查订单
+		return nil
+	}
+	throttle := newFlowLogThrottle()
+	var invalidErr error
+	allValid := false
+	err := pollCertificateFlow(ctx, func() (bool, error) {
+		valid := true
 		for _, record := range records {
+			if strings.TrimSpace(record.AuthorizationURL) == "" {
+				continue
+			}
 			authz, err := client.GetAuthorization(ctx, record.AuthorizationURL)
 			trace := acmeTrace(account.Provider, "GetAuthorization", gin.H{"authorizationUrl": record.AuthorizationURL}, authz, err)
 			if err != nil {
-				h.logCertificate(*row, *account, "verify", "failed", "检查ACME域名验证失败："+err.Error(), trace)
-				allValid = false
+				if ctx.Err() == nil && throttle.allow("authz_failed:"+err.Error()) {
+					h.logCertificate(*row, *account, "verify", "failed", "检查ACME域名验证失败："+err.Error(), trace)
+				}
+				valid = false
 				continue
 			}
-			if authz.Status == acme.StatusInvalid {
-				h.logCertificate(*row, *account, "verify", "failed", "ACME域名验证失败", trace)
-				return fmt.Errorf("ACME域名验证失败：%s", record.Domain)
+			if authz.Status == acme.StatusInvalid || authz.Status == acme.StatusDeactivated || authz.Status == acme.StatusExpired || authz.Status == acme.StatusRevoked {
+				invalidErr = fmt.Errorf("%w：%s%s", errACMEAuthorizationInvalid, record.Domain, acmeAuthorizationErrorDetail(authz))
+				h.logCertificate(*row, *account, "verify", "failed", invalidErr.Error(), trace)
+				return true, nil
 			}
 			if authz.Status != acme.StatusValid {
-				allValid = false
+				valid = false
 			}
-			h.logCertificate(*row, *account, "verify", "success", "已检查ACME域名验证状态", trace)
 		}
-		if allValid {
-			_ = h.db.Model(row).Updates(map[string]any{"provider_status_msg": "ACME域名验证已生效"}).Error
-			return nil
+		if valid {
+			allValid = true
+			return true, nil
 		}
+		if throttle.allow("waiting") {
+			h.logCertificate(*row, *account, "verify", "success", "ACME域名验证进行中，继续等待", nil)
+		}
+		return false, nil
+	})
+	if err != nil {
+		return err
 	}
-	return fmt.Errorf("ACME域名验证暂未生效")
+	if invalidErr != nil {
+		return invalidErr
+	}
+	if !allValid {
+		return fmt.Errorf("ACME域名验证暂未生效，后台将继续检查")
+	}
+	_ = h.db.Model(row).Updates(map[string]any{"provider_status_msg": "ACME域名验证已生效"}).Error
+	return nil
 }
 
 func (h *CertificateHandler) startTencentRevokeFlow(rowID uint, accountID uint) {
+	ctx, ok := h.claimCertificateWork(rowID)
+	if !ok {
+		return
+	}
 	go func() {
-		if err := h.runTencentRevokeFlow(context.Background(), rowID, accountID); err != nil {
+		defer h.releaseCertificateContentWork(rowID)
+		if err := h.runTencentRevokeFlow(ctx, rowID, accountID); err != nil && ctx.Err() == nil {
 			var row model.Certificate
 			var account model.SSLAccount
 			if h.db.First(&row, rowID).Error == nil && h.db.First(&account, accountID).Error == nil {
@@ -1348,7 +1592,6 @@ func (h *CertificateHandler) runTencentRevokeFlow(ctx context.Context, rowID uin
 	if strings.TrimSpace(row.ProviderCertificateID) == "" {
 		return fmt.Errorf("证书缺少腾讯云证书ID")
 	}
-	h.db.First(&row, row.ID)
 	if trace, err := h.ensureTencentRevokeAuthRecordsFromDetail(ctx, &row, account); err != nil {
 		h.logCertificate(row, account, "revoke_verify", "failed", "确认吊销DNS验证记录失败："+err.Error(), trace)
 		return err
@@ -1360,53 +1603,70 @@ func (h *CertificateHandler) runTencentRevokeFlow(ctx context.Context, rowID uin
 	}
 	h.logCertificate(row, account, "revoke_verify", "success", "已主动触发吊销域名验证", trace)
 
+	throttle := newFlowLogThrottle()
 	verified := false
-	for i := 0; i < certFlowMaxChecks; i++ {
-		if i > 0 {
-			time.Sleep(certFlowInterval)
-		}
+	err = pollCertificateFlow(ctx, func() (bool, error) {
 		results, trace, err := tencentCheckCertificateDomainVerification(ctx, account, row.ProviderCertificateID)
 		if err != nil {
-			h.logCertificate(row, account, "revoke_check", "failed", "检查吊销域名验证失败："+err.Error(), traceFromError(err))
-			continue
+			if ctx.Err() == nil && throttle.allow("check_failed:"+err.Error()) {
+				h.logCertificate(row, account, "revoke_check", "failed", "检查吊销域名验证失败："+err.Error(), traceFromError(err))
+			}
+			return false, nil
 		}
 		if tencentVerificationPassed(results) {
 			h.logCertificate(row, account, "revoke_check", "success", "吊销域名验证已通过", trace)
 			verified = true
-			break
+			return true, nil
 		}
-		h.logCertificate(row, account, "revoke_check", "success", "吊销域名验证暂未通过", trace)
+		if throttle.allow("waiting") {
+			h.logCertificate(row, account, "revoke_check", "success", "吊销域名验证暂未通过", trace)
+		}
+		return false, nil
+	})
+	if err != nil {
+		return err
 	}
 	if !verified {
-		_ = h.db.Model(&row).Updates(map[string]any{"provider_status_msg": "吊销域名验证暂未通过，请稍后查看日志"}).Error
+		_ = h.db.Model(&row).Updates(map[string]any{"provider_status_msg": "吊销域名验证暂未通过，请稍后点击“验证”继续"}).Error
 		return fmt.Errorf("吊销域名验证暂未通过")
 	}
 
-	for i := 0; i < certFlowMaxChecks; i++ {
-		if i > 0 {
-			time.Sleep(certFlowInterval)
-		}
+	revoked := false
+	err = pollCertificateFlow(ctx, func() (bool, error) {
 		detail, trace, err := tencentDescribeCertificate(ctx, account, row.ProviderCertificateID)
 		if err != nil {
-			h.logCertificate(row, account, "revoke_status", "failed", "检查吊销状态失败："+err.Error(), traceFromError(err))
-			continue
+			if ctx.Err() == nil && throttle.allow("status_failed:"+err.Error()) {
+				h.logCertificate(row, account, "revoke_status", "failed", "检查吊销状态失败："+err.Error(), traceFromError(err))
+			}
+			return false, nil
 		}
+		previousStatus := row.Status
 		if detail != nil {
 			h.applyTencentDetail(&row, detail)
 			_ = h.db.First(&row, row.ID).Error
 		}
-		h.logCertificate(row, account, "revoke_status", "success", "已检查吊销状态", trace)
+		if row.Status != previousStatus || throttle.allow("status_checked") {
+			h.logCertificate(row, account, "revoke_status", "success", "已检查吊销状态", trace)
+		}
 		if row.Status == certStatusRevoked {
+			revoked = true
 			cleaned, err := h.cleanupAuthRecordWithMessage(ctx, &row, "certificate_revoke_cleanup", "证书吊销完成，已删除SSL验证记录", "证书已吊销，DNS验证记录已删除")
 			if err != nil {
 				h.logCertificate(row, account, "cleanup", "failed", "删除吊销DNS验证记录失败："+err.Error(), nil)
 			} else if cleaned {
 				h.logCertificate(row, account, "cleanup", "success", "证书已吊销，DNS验证记录已删除", nil)
 			}
-			return nil
+			return true, nil
 		}
+		return false, nil
+	})
+	if err != nil {
+		return err
 	}
-	return fmt.Errorf("吊销状态仍在处理中")
+	if !revoked {
+		return fmt.Errorf("吊销状态仍在处理中")
+	}
+	return nil
 }
 
 func (h *CertificateHandler) createTencentRevokeAuthRecords(ctx context.Context, row *model.Certificate, auths []tencentRevokeAuth) error {
@@ -1492,15 +1752,16 @@ func (h *CertificateHandler) ensureTencentRevokeAuthRecordsFromDetail(ctx contex
 	return trace, nil
 }
 
-func (h *CertificateHandler) submitACMECertificate(ctx context.Context, row *model.Certificate, account *model.SSLAccount) (*tencentRequestTrace, error) {
+// submitACMECertificate 等待DNS验证记录生效后通知CA开始验证。accepted 表示本次确实提交了新的验证。
+func (h *CertificateHandler) submitACMECertificate(ctx context.Context, row *model.Certificate, account *model.SSLAccount) (*tencentRequestTrace, bool, error) {
 	var proxyErr error
 	ctx, proxyErr = h.contextWithSSLHTTPClient(ctx, *account)
 	if proxyErr != nil {
-		return nil, proxyErr
+		return nil, false, proxyErr
 	}
 	client, trace, err := h.acmeClient(ctx, account)
 	if err != nil {
-		return trace, err
+		return trace, false, err
 	}
 	records := parseACMEAuthRecords(row.AuthRecords)
 	if len(records) == 0 && strings.TrimSpace(row.AuthRecordID) != "" {
@@ -1511,9 +1772,8 @@ func (h *CertificateHandler) submitACMECertificate(ctx context.Context, row *mod
 			Domain: row.CommonName,
 		})
 	}
-	if err := h.waitACMEDNSPropagation(ctx, row, records); err != nil {
-		return acmeTrace(account.Provider, "WaitDNS01", gin.H{"records": records}, nil, err), err
-	}
+	pending := make([]acmeAuthRecord, 0, len(records))
+	challenges := map[string]*acme.Challenge{}
 	for _, record := range records {
 		if strings.TrimSpace(record.ChallengeURL) == "" {
 			continue
@@ -1521,29 +1781,41 @@ func (h *CertificateHandler) submitACMECertificate(ctx context.Context, row *mod
 		challenge, err := client.GetChallenge(ctx, record.ChallengeURL)
 		trace = acmeTrace(account.Provider, "GetChallenge", gin.H{"challengeUrl": record.ChallengeURL}, challenge, err)
 		if err != nil {
-			return trace, err
-		}
-		if challenge.Status == acme.StatusValid {
-			continue
+			if isACMEOrderUnusable(err) {
+				return trace, false, fmt.Errorf("%w：%v", errACMEChallengeInvalid, err)
+			}
+			return trace, false, err
 		}
 		if challenge.Status == acme.StatusInvalid {
-			return trace, fmt.Errorf("ACME DNS验证已失效，请重新申请证书订单")
+			return trace, false, fmt.Errorf("%w：%s%s", errACMEChallengeInvalid, record.Domain, acmeProblemDetail(challenge.Error))
 		}
 		if challenge.Status == acme.StatusPending {
-			accepted, err := client.Accept(ctx, challenge)
-			trace = acmeTrace(account.Provider, "AcceptChallenge", gin.H{"challengeUrl": record.ChallengeURL}, accepted, err)
+			pending = append(pending, record)
+			challenges[record.ChallengeURL] = challenge
+		}
+	}
+	accepted := false
+	if len(pending) > 0 {
+		// 只在需要提交时检查DNS生效，避免CA查询到旧缓存导致验证失败
+		if err := h.waitACMEDNSPropagation(ctx, row, pending); err != nil {
+			return acmeTrace(account.Provider, "WaitDNS01", gin.H{"records": pending}, nil, err), false, err
+		}
+		for _, record := range pending {
+			acceptedChallenge, err := client.Accept(ctx, challenges[record.ChallengeURL])
+			trace = acmeTrace(account.Provider, "AcceptChallenge", gin.H{"challengeUrl": record.ChallengeURL}, acceptedChallenge, err)
 			if err != nil {
-				return trace, err
+				return trace, false, err
 			}
+			accepted = true
 		}
 	}
 	if err := h.db.Model(row).Updates(map[string]any{
 		"status":              certStatusSubmitted,
 		"provider_status_msg": "DNS验证记录已提交，等待CA验证",
 	}).Error; err != nil {
-		return trace, err
+		return trace, accepted, err
 	}
-	return trace, nil
+	return trace, accepted, nil
 }
 
 func (h *CertificateHandler) waitACMEDNSPropagation(ctx context.Context, row *model.Certificate, records []acmeAuthRecord) error {
@@ -1559,9 +1831,11 @@ func (h *CertificateHandler) waitACMEDNSPropagation(ctx context.Context, row *mo
 		return fmt.Errorf("无法定位证书关联域名，无法检查DNS验证记录：%w", err)
 	}
 	var missing []string
-	for i := 0; i < acmeDNSMaxChecks; i++ {
+	for i := 0; i < acmeDNSPropagationChecks; i++ {
 		if i > 0 {
-			time.Sleep(certFlowInterval)
+			if err := sleepContext(ctx, certFlowInterval); err != nil {
+				return err
+			}
 		}
 		missing = missing[:0]
 		for _, record := range records {
@@ -1569,8 +1843,8 @@ func (h *CertificateHandler) waitACMEDNSPropagation(ctx context.Context, row *mo
 			if name == "" || strings.TrimSpace(record.Value) == "" {
 				continue
 			}
-			values, err := net.DefaultResolver.LookupTXT(ctx, name)
-			if err != nil || !containsTXTValue(values, record.Value) {
+			// 直接查询权威DNS，避免递归DNS的否定缓存导致长时间误判为未生效
+			if !txtRecordPropagated(ctx, domain.Name, name, record.Value) {
 				missing = append(missing, name)
 			}
 		}
@@ -1601,20 +1875,42 @@ func (h *CertificateHandler) refreshACMECertificate(ctx context.Context, row *mo
 	if strings.TrimSpace(row.ProviderOrderID) == "" {
 		return trace, fmt.Errorf("证书缺少ACME订单URL")
 	}
+	inProgress := isCertificateIssueInProgress(row.Status)
 	order, err := client.GetOrder(ctx, row.ProviderOrderID)
 	trace = acmeTrace(account.Provider, "GetOrder", gin.H{"orderUrl": row.ProviderOrderID}, order, err)
 	if err != nil {
+		if inProgress && isACMEOrderUnusable(err) {
+			// 订单已过期或被CA删除，无法继续签发：标记失败并按退避自动重新申请
+			h.markCertificateFailed(row, *account, "ACME订单已失效或不存在（可能已过期）："+err.Error(), trace)
+			return trace, nil
+		}
 		return trace, err
 	}
+	if inProgress {
+		if order.Status == acme.StatusInvalid {
+			h.markCertificateFailed(row, *account, "ACME订单无效"+acmeOrderErrorDetail(order), trace)
+			return trace, nil
+		}
+		if acmeOrderExpired(order) {
+			h.markCertificateFailed(row, *account, "ACME订单已过期", trace)
+			return trace, nil
+		}
+	}
 	if order.Status == acme.StatusPending && hasACMEChallengeRecords(row) {
-		submitTrace, err := h.submitACMECertificate(ctx, row, account)
+		submitTrace, accepted, err := h.submitACMECertificate(ctx, row, account)
 		if submitTrace != nil {
 			trace = submitTrace
 		}
 		if err != nil {
+			if errors.Is(err, errACMEChallengeInvalid) {
+				h.markCertificateFailed(row, *account, err.Error(), trace)
+				return trace, nil
+			}
 			return trace, err
 		}
-		h.logCertificate(*row, *account, "submit", "success", "已提交ACME DNS验证", trace)
+		if accepted {
+			h.logCertificate(*row, *account, "submit", "success", "已提交ACME DNS验证", trace)
+		}
 		order, err = client.GetOrder(ctx, row.ProviderOrderID)
 		trace = acmeTrace(account.Provider, "GetOrder", gin.H{"orderUrl": row.ProviderOrderID}, order, err)
 		if err != nil {
@@ -1629,6 +1925,14 @@ func (h *CertificateHandler) refreshACMECertificate(ctx context.Context, row *mo
 	if localIssued {
 		status = certStatusIssued
 		statusMsg = "证书已签发，本地证书内容已保存"
+	}
+	if !inProgress && status == certStatusFailed {
+		// 已签发/已吊销证书的历史订单不影响当前证书状态
+		status = row.Status
+	}
+	if status == certStatusFailed {
+		h.markCertificateFailed(row, *account, "ACME订单无效"+acmeOrderErrorDetail(order), trace)
+		return trace, nil
 	}
 	updates := map[string]any{
 		"provider_status":     order.Status,
@@ -1681,7 +1985,8 @@ func (h *CertificateHandler) refreshACMECertificate(ctx context.Context, row *mo
 }
 
 func (h *CertificateHandler) finalizeACMECertificate(ctx context.Context, row *model.Certificate, account *model.SSLAccount, client *acme.Client, order *acme.Order) error {
-	key, err := parseRSAPrivateKeyPEM(row.KeyPEM)
+	// 新订单使用 pending_key_pem；兼容旧版本直接写入 key_pem 的进行中订单
+	key, err := parseRSAPrivateKeyPEM(firstNonEmpty(row.PendingKeyPEM, row.KeyPEM))
 	if err != nil {
 		return err
 	}
@@ -1779,19 +2084,38 @@ func (h *CertificateHandler) saveACMECertificateChain(row *model.Certificate, ce
 	if len(chain) == 0 {
 		return fmt.Errorf("ACME未返回证书内容")
 	}
-	certPEM := string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: chain[0]}))
+	certPEM := strings.TrimSpace(string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: chain[0]})))
 	chainPEMs := make([]string, 0, len(chain)-1)
 	for _, der := range chain[1:] {
 		chainPEMs = append(chainPEMs, strings.TrimSpace(string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}))))
+	}
+	// 证书与私钥必须一起替换：优先使用申请时生成的新私钥，旧数据回退到当前私钥
+	keyPEM := ""
+	for _, candidate := range []string{row.PendingKeyPEM, row.KeyPEM} {
+		if strings.TrimSpace(candidate) == "" {
+			continue
+		}
+		if _, err := parseCertificateWithMatchingKey(certPEM, candidate); err == nil {
+			keyPEM = strings.TrimSpace(candidate)
+			break
+		}
+	}
+	if keyPEM == "" {
+		return fmt.Errorf("ACME返回的证书与本地私钥不匹配，未保存证书内容")
 	}
 	updates := map[string]any{
 		"provider_certificate_id": certURL,
 		"content_certificate_id":  certURL,
 		"provider_status":         acme.StatusValid,
 		"provider_status_msg":     "证书已签发",
-		"cert_pem":                strings.TrimSpace(certPEM),
+		"cert_pem":                certPEM,
+		"key_pem":                 keyPEM,
+		"pending_key_pem":         "",
 		"chain_pem":               strings.TrimSpace(strings.Join(chainPEMs, "\n")),
 		"status":                  certStatusIssued,
+		"retry_count":             0,
+		"next_retry_at":           nil,
+		"apply_started_at":        nil,
 	}
 	if cert, err := x509.ParseCertificate(chain[0]); err == nil {
 		updates["issuer"] = cert.Issuer.CommonName
@@ -2029,6 +2353,10 @@ func (h *CertificateHandler) downloadTencentCertificate(ctx context.Context, row
 		"issuer":                 cert.Issuer.CommonName,
 		"serial_number":          cert.SerialNumber.String(),
 		"expires_at":             cert.NotAfter,
+		"pending_key_pem":        "",
+		"retry_count":            0,
+		"next_retry_at":          nil,
+		"apply_started_at":       nil,
 	}
 	if err := h.db.Model(row).Updates(updates).Error; err != nil {
 		return err
@@ -2079,7 +2407,7 @@ func (h *CertificateHandler) applyTencentDetail(row *model.Certificate, detail *
 
 func (h *CertificateHandler) certificateAccount(c *gin.Context) (model.Certificate, model.SSLAccount, bool) {
 	var row model.Certificate
-	if err := h.db.First(&row, c.Param("id")).Error; err != nil {
+	if err := h.db.First(&row, core.ParamID(c, "id")).Error; err != nil {
 		core.Fail(c, http.StatusNotFound, "证书不存在")
 		return row, model.SSLAccount{}, false
 	}
@@ -2091,26 +2419,36 @@ func (h *CertificateHandler) certificateAccount(c *gin.Context) (model.Certifica
 	return row, account, true
 }
 
-func (h *CertificateHandler) validateRequest(c *gin.Context, req certificateRequest) (model.Domain, model.SSLAccount, bool) {
+func (h *CertificateHandler) validateRequest(c *gin.Context, req certificateRequest) (model.Domain, model.SSLAccount, string, string, bool) {
 	var domain model.Domain
 	if err := h.db.First(&domain, req.DomainID).Error; err != nil {
 		core.Fail(c, http.StatusNotFound, "域名不存在")
-		return domain, model.SSLAccount{}, false
+		return domain, model.SSLAccount{}, "", "", false
 	}
 	var account model.SSLAccount
 	if err := h.db.First(&account, req.SSLAccountID).Error; err != nil {
 		core.Fail(c, http.StatusNotFound, "SSL账号不存在")
-		return domain, account, false
+		return domain, account, "", "", false
 	}
 	if account.Status == model.StatusDisabled {
 		core.Fail(c, http.StatusBadRequest, "SSL账号已停用")
-		return domain, account, false
+		return domain, account, "", "", false
 	}
 	if strings.TrimSpace(account.Provider) == "" {
 		core.Fail(c, http.StatusBadRequest, "SSL账号缺少证书服务")
-		return domain, account, false
+		return domain, account, "", "", false
 	}
-	return domain, account, true
+	commonName := normalizeCertificateName(req.CommonName)
+	if commonName == "" {
+		commonName = normalizeCertificateName(domain.Name)
+	}
+	sans := strings.TrimSpace(req.SANs)
+	names := certificateNames(&model.Certificate{CommonName: commonName, SANs: sans}, commonName)
+	if err := validateCertificateNames(domain.Name, account.Provider, names); err != nil {
+		core.Fail(c, http.StatusBadRequest, err.Error())
+		return domain, account, "", "", false
+	}
+	return domain, account, commonName, sans, true
 }
 
 func (h *CertificateHandler) resolveCertificateDomain(row *model.Certificate, candidates ...string) (model.Domain, error) {
@@ -2200,9 +2538,10 @@ func (h *CertificateHandler) activeCertificateTask(accountID uint, commonName, s
 	if err != nil {
 		return model.Certificate{}, false, err
 	}
-	targetSANs := strings.TrimSpace(sans)
+	// 按规范化后的域名集合比较，避免顺序、大小写或分隔符不同导致重复申请
+	target := certificateNamesKey(commonName, sans)
 	for _, row := range rows {
-		if strings.TrimSpace(row.SANs) == targetSANs {
+		if certificateNamesKey(row.CommonName, row.SANs) == target {
 			return row, true, nil
 		}
 	}
@@ -2751,6 +3090,33 @@ func (h *CertificateHandler) acmeClient(ctx context.Context, account *model.SSLA
 	if strings.TrimSpace(account.AccountURI) != "" && strings.TrimSpace(account.AccountKeyPEM) != "" {
 		client.KID = acme.KeyID(account.AccountURI)
 		return client, acmeTrace(account.Provider, "Account", gin.H{"directoryUrl": directoryURL}, gin.H{"accountUri": account.AccountURI}, nil), nil
+	}
+	// 同一SSL账号首次注册时加锁，避免并发申请各自注册出不同的ACME账号（订单归属错乱）
+	lock := acmeAccountLock(account.ID)
+	lock.Lock()
+	defer lock.Unlock()
+	if account.ID > 0 {
+		var latest model.SSLAccount
+		if err := h.db.Select("id", "account_uri", "account_key_pem").First(&latest, account.ID).Error; err == nil &&
+			strings.TrimSpace(latest.AccountURI) != "" && strings.TrimSpace(latest.AccountKeyPEM) != "" {
+			latestKey, err := parseRSAPrivateKeyPEM(latest.AccountKeyPEM)
+			if err == nil {
+				account.AccountURI = latest.AccountURI
+				account.AccountKeyPEM = latest.AccountKeyPEM
+				client.Key = latestKey
+				client.KID = acme.KeyID(latest.AccountURI)
+				return client, acmeTrace(account.Provider, "Account", gin.H{"directoryUrl": directoryURL}, gin.H{"accountUri": account.AccountURI}, nil), nil
+			}
+		}
+		if strings.TrimSpace(account.AccountKeyPEM) == "" {
+			// 其他流程可能已生成并保存账号私钥但尚未拿到URI，复用该私钥
+			if err := h.db.Select("id", "account_key_pem").First(&latest, account.ID).Error; err == nil && strings.TrimSpace(latest.AccountKeyPEM) != "" {
+				if latestKey, err := parseRSAPrivateKeyPEM(latest.AccountKeyPEM); err == nil {
+					key, keyPEM = latestKey, latest.AccountKeyPEM
+					client.Key = key
+				}
+			}
+		}
 	}
 	acct := &acme.Account{Contact: []string{"mailto:" + strings.TrimSpace(account.Email)}}
 	if strings.TrimSpace(account.EABKid) != "" && strings.TrimSpace(account.EABHmacKey) != "" {

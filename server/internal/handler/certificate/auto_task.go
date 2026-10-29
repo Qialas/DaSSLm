@@ -76,7 +76,7 @@ func (h *AutoTaskHandler) List(c *gin.Context) {
 
 func (h *AutoTaskHandler) Get(c *gin.Context) {
 	var row model.AutoTask
-	if err := h.db.Preload("Targets").First(&row, c.Param("id")).Error; err != nil {
+	if err := h.db.Preload("Targets").First(&row, core.ParamID(c, "id")).Error; err != nil {
 		core.Fail(c, http.StatusNotFound, "自动任务不存在")
 		return
 	}
@@ -120,7 +120,7 @@ func (h *AutoTaskHandler) Create(c *gin.Context) {
 
 func (h *AutoTaskHandler) Update(c *gin.Context) {
 	var row model.AutoTask
-	if err := h.db.First(&row, c.Param("id")).Error; err != nil {
+	if err := h.db.First(&row, core.ParamID(c, "id")).Error; err != nil {
 		core.Fail(c, http.StatusNotFound, "自动任务不存在")
 		return
 	}
@@ -172,7 +172,11 @@ func (h *AutoTaskHandler) Update(c *gin.Context) {
 }
 
 func (h *AutoTaskHandler) Delete(c *gin.Context) {
-	taskID := c.Param("id")
+	taskID := core.ParamID(c, "id")
+	if taskID == 0 {
+		core.Fail(c, http.StatusBadRequest, "自动任务不存在")
+		return
+	}
 	if err := h.db.Transaction(func(tx *gorm.DB) error {
 		if err := tx.Where("task_id = ?", taskID).Delete(&model.AutoTaskTarget{}).Error; err != nil {
 			return err
@@ -260,12 +264,12 @@ func (h *AutoTaskHandler) runAutoDeployTaskAsync(taskID uint) {
 }
 
 func (h *AutoTaskHandler) Run(c *gin.Context) {
-	taskID, _ := strconv.Atoi(c.Param("id"))
-	if taskID <= 0 {
+	taskID := core.ParamID(c, "id")
+	if taskID == 0 {
 		core.Fail(c, http.StatusBadRequest, "自动部署任务不存在")
 		return
 	}
-	if err := h.runAutoDeployTask(c.Request.Context(), uint(taskID)); err != nil {
+	if err := h.runAutoDeployTask(c.Request.Context(), taskID); err != nil {
 		core.Fail(c, http.StatusBadRequest, "执行自动部署失败："+err.Error())
 		return
 	}
@@ -298,7 +302,7 @@ func (h *AutoTaskHandler) runAutoDeployTask(ctx context.Context, taskID uint) er
 		h.finishAutoTask(task, nil, "failed", "SSL证书不存在："+err.Error())
 		return err
 	}
-	if cert.Status != certStatusIssued {
+	if !certificateDeployable(cert) {
 		err := fmt.Errorf("SSL证书未签发，暂不能部署")
 		h.finishAutoTask(task, nil, "failed", err.Error())
 		return err
@@ -401,9 +405,11 @@ func (h *AutoTaskHandler) certificateIsIssued(certificateID uint) bool {
 	if certificateID == 0 {
 		return false
 	}
-	var count int64
-	h.db.Model(&model.Certificate{}).Where("id = ? AND status = ?", certificateID, certStatusIssued).Count(&count)
-	return count > 0
+	var cert model.Certificate
+	if err := h.db.First(&cert, certificateID).Error; err != nil {
+		return false
+	}
+	return certificateDeployable(cert)
 }
 
 func triggerCertificateAutoDeployments(db *gorm.DB, certificate model.Certificate) {

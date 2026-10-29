@@ -99,6 +99,7 @@ export const deleteDomainRecord = (domainId: number | string, recordId: number |
 
 export const submitCertificate = (id: number) => api<Row>(`/certificates/${id}/submit`, { method: 'POST' })
 export const revokeCertificate = (id: number) => api<Row>(`/certificates/${id}/revoke`, { method: 'POST' })
+export const resetCertificate = (id: number) => api<Row>(`/certificates/${id}/reset`, { method: 'POST' })
 export const deployCertificate = (id: number, data: unknown) =>
   api<Row>(`/certificates/${id}/deploy`, { method: 'POST', body: json(data) })
 export const getCertificateDetail = (id: number, params: Params = {}) => api<Row>(`/certificates/${id}/detail${toQuery(params)}`)
@@ -123,6 +124,8 @@ export const testNotificationSetting = (id: number) => api<Row>(`/notification-s
 export const getNotificationRules = () => api<Row[]>('/notification-rules')
 export const updateNotificationRules = (data: unknown) =>
   api<Row[]>('/notification-rules', { method: 'PUT', body: json(data) })
+export const changePassword = (data: { oldPassword: string; newPassword: string }) =>
+  api<{ token: string; expiresAt: string }>('/auth/password', { method: 'PUT', body: json(data) })
 export const getSystemTasks = () => api<Row[]>('/system-tasks')
 export const updateSystemTask = (key: string, data: unknown) =>
   api<Row>(`/system-tasks/${encodeURIComponent(key)}`, { method: 'PUT', body: json(data) })

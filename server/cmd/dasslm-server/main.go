@@ -10,7 +10,7 @@ import (
 )
 
 // version 当前版本号，发布时可通过 -ldflags "-X main.version=x.y.z" 覆盖
-var version = "0.0.2"
+var version = "0.0.3"
 
 func main() {
 	if len(os.Args) > 1 && (os.Args[1] == "-v" || os.Args[1] == "--version" || os.Args[1] == "version") {

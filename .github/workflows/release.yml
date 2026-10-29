@@ -66,11 +66,9 @@ jobs:
       - name: 构建管理端并嵌入服务端
         run: server/scripts/sync-admin-web.sh
 
-      - name: 打包 amd64 / arm64
+      - name: 打包 amd64
         run: |
-          for arch in amd64 arm64; do
-            GOARCH=${arch} VERSION=${{ steps.meta.outputs.version }} SKIP_WEB_BUILD=1 server/scripts/package-linux.sh
-          done
+          GOARCH=amd64 VERSION=${{ steps.meta.outputs.version }} SKIP_WEB_BUILD=1 server/scripts/package-linux.sh
           cd dist
           sha256sum *.tar.gz > SHA256SUMS.txt
           cat SHA256SUMS.txt
@@ -87,7 +85,6 @@ jobs:
             echo ""
             echo "**下载**"
             echo "- \`dasslm-server-linux-amd64-${tag}.tar.gz\`：Linux x86_64"
-            echo "- \`dasslm-server-linux-arm64-${tag}.tar.gz\`：Linux ARM64"
             echo ""
             echo "解压后修改 \`config/config.yaml\` 中的数据库连接，运行 \`./dasslm-server\`；升级时保留原有配置文件，只替换程序。"
             echo ""
@@ -103,7 +100,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           tag=${{ steps.meta.outputs.tag }}
-          assets="dist/dasslm-server-linux-amd64-${tag}.tar.gz dist/dasslm-server-linux-arm64-${tag}.tar.gz dist/SHA256SUMS.txt"
+          assets="dist/dasslm-server-linux-amd64-${tag}.tar.gz dist/SHA256SUMS.txt"
           if gh release view "${tag}" >/dev/null 2>&1; then
             gh release upload "${tag}" ${assets} --clobber
             gh release edit "${tag}" --notes-file notes.md

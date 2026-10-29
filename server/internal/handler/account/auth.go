@@ -80,6 +80,63 @@ func (h *AuthHandler) Me(c *gin.Context) {
 	core.Ok(c, user)
 }
 
+const minPasswordLength = 8
+
+type changePasswordRequest struct {
+	OldPassword string `json:"oldPassword"`
+	NewPassword string `json:"newPassword"`
+}
+
+// ChangePassword 修改当前登录用户自己的密码，需校验原密码。
+// 修改后凭证版本递增，其他设备上的登录全部失效；当前会话返回新凭证继续使用。
+func (h *AuthHandler) ChangePassword(c *gin.Context) {
+	var req changePasswordRequest
+	if err := c.ShouldBindJSON(&req); err != nil || req.OldPassword == "" || req.NewPassword == "" {
+		core.Fail(c, http.StatusBadRequest, "请输入原密码和新密码")
+		return
+	}
+	if len(req.NewPassword) < minPasswordLength {
+		core.Fail(c, http.StatusBadRequest, "新密码至少需要8位")
+		return
+	}
+	if req.NewPassword == req.OldPassword {
+		core.Fail(c, http.StatusBadRequest, "新密码不能与原密码相同")
+		return
+	}
+	var user model.User
+	if err := h.db.First(&user, c.GetUint("userId")).Error; err != nil {
+		core.Fail(c, http.StatusNotFound, "用户不存在")
+		return
+	}
+	if err := bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(req.OldPassword)); err != nil {
+		core.Fail(c, http.StatusBadRequest, "原密码错误")
+		return
+	}
+	hash, err := bcrypt.GenerateFromPassword([]byte(req.NewPassword), bcrypt.DefaultCost)
+	if err != nil {
+		core.Fail(c, http.StatusInternalServerError, "密码加密失败")
+		return
+	}
+	// 以原凭证版本为条件更新，防止并发修改时两个请求都拿到有效的新凭证
+	result := h.db.Model(&model.User{}).Where("id = ? AND token_version = ?", user.ID, user.TokenVersion).
+		Updates(map[string]any{"password_hash": string(hash), "token_version": user.TokenVersion + 1})
+	if result.Error != nil {
+		core.Fail(c, http.StatusInternalServerError, "保存密码失败")
+		return
+	}
+	if result.RowsAffected == 0 {
+		core.Fail(c, http.StatusConflict, "登录状态已变化，请重新登录后再试")
+		return
+	}
+	user.TokenVersion++
+	token, expiresAt, err := auth.GenerateToken(h.cfg.JWT.Secret, h.cfg.JWT.ExpireHours, user.ID, user.Username, user.Role, user.TokenVersion)
+	if err != nil {
+		core.Fail(c, http.StatusInternalServerError, "密码已修改，生成新登录凭证失败，请重新登录")
+		return
+	}
+	core.Ok(c, gin.H{"token": token, "expiresAt": expiresAt})
+}
+
 func (h *AuthHandler) recordLogin(c *gin.Context, userID uint, username, status, message string) {
 	_ = h.db.Create(&model.LoginLog{
 		UserID:    userID,

@@ -45,7 +45,7 @@ func (h *ResourceHandler[T]) List(c *gin.Context) {
 
 func (h *ResourceHandler[T]) Get(c *gin.Context) {
 	var row T
-	if err := h.db.First(&row, c.Param("id")).Error; err != nil {
+	if err := h.db.First(&row, ParamID(c, "id")).Error; err != nil {
 		fail(c, http.StatusNotFound, "数据不存在")
 		return
 	}
@@ -66,7 +66,7 @@ func (h *ResourceHandler[T]) Create(c *gin.Context) {
 }
 
 func (h *ResourceHandler[T]) Update(c *gin.Context) {
-	id := c.Param("id")
+	id := ParamID(c, "id")
 	var row T
 	if err := h.db.First(&row, id).Error; err != nil {
 		fail(c, http.StatusNotFound, "数据不存在")
@@ -84,7 +84,12 @@ func (h *ResourceHandler[T]) Update(c *gin.Context) {
 }
 
 func (h *ResourceHandler[T]) Delete(c *gin.Context) {
-	if err := h.db.Delete(new(T), c.Param("id")).Error; err != nil {
+	id := ParamID(c, "id")
+	if id == 0 {
+		fail(c, http.StatusBadRequest, "数据不存在")
+		return
+	}
+	if err := h.db.Delete(new(T), id).Error; err != nil {
 		fail(c, http.StatusInternalServerError, "删除失败")
 		return
 	}

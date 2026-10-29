@@ -34,11 +34,15 @@
           </div>
         </div>
         <ul class="py-4 mt-3 border-t border-g-300/80">
-          <li class="btn-item" @click="goPage('/settings/profile')">
+          <li class="btn-item" @click="openChangePassword">
+            <ArtSvgIcon icon="ri:lock-password-line" />
+            <span>修改密码</span>
+          </li>
+          <li v-if="isAdmin" class="btn-item" @click="goPage('/settings/profile')">
             <ArtSvgIcon icon="ri:user-3-line" />
             <span>后台用户</span>
           </li>
-          <li class="btn-item" @click="goPage('/settings/base')">
+          <li v-if="isAdmin" class="btn-item" @click="goPage('/settings/base')">
             <ArtSvgIcon icon="ri:settings-3-line" />
             <span>基础设置</span>
           </li>
@@ -54,6 +58,7 @@
       </div>
     </template>
   </ElPopover>
+  <ChangePasswordDialog v-model="changePasswordOpen" />
 </template>
 
 <script setup lang="ts">
@@ -61,6 +66,7 @@
   import { useRouter } from 'vue-router'
   import { ElMessageBox } from 'element-plus'
   import { useUserStore } from '@/store/modules/user'
+  import ChangePasswordDialog from '@/components/dasslm/ChangePasswordDialog.vue'
 
   defineOptions({ name: 'ArtUserMenu' })
 
@@ -70,6 +76,13 @@
 
   const { getUserInfo: userInfo } = storeToRefs(userStore)
   const userMenuPopover = ref()
+  const changePasswordOpen = ref(false)
+  const isAdmin = computed(() => userInfo.value.roles?.includes('admin'))
+
+  const openChangePassword = (): void => {
+    closeUserMenu()
+    changePasswordOpen.value = true
+  }
 
   /**
    * 页面跳转

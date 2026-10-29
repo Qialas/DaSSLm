@@ -118,7 +118,7 @@ func (h *DeployAccountHandler) Test(c *gin.Context) {
 
 func (h *DeployAccountHandler) deployAccount(c *gin.Context) (model.DeployAccount, bool) {
 	var account model.DeployAccount
-	if err := h.db.First(&account, c.Param("id")).Error; err != nil {
+	if err := h.db.First(&account, core.ParamID(c, "id")).Error; err != nil {
 		core.Fail(c, http.StatusNotFound, "部署账号不存在")
 		return account, false
 	}

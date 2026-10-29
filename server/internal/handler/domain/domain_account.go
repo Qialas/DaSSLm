@@ -27,7 +27,7 @@ func NewDomainAccountHandler(db *gorm.DB) *DomainAccountHandler {
 
 func (h *DomainAccountHandler) Test(c *gin.Context) {
 	var account model.DomainAccount
-	if err := h.db.First(&account, c.Param("id")).Error; err != nil {
+	if err := h.db.First(&account, core.ParamID(c, "id")).Error; err != nil {
 		core.Fail(c, http.StatusNotFound, "域名账号不存在")
 		return
 	}

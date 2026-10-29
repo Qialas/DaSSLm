@@ -13,7 +13,7 @@ export const routeModules: AppRouteRecord[] = [
   page('/tasks', 'Tasks', '自动任务', 'tasks', 'ri:time-line'),
   {
     path: '/accounts', name: 'Accounts', component: '/index/index', redirect: '/accounts/domain',
-    meta: { title: '账号管理', icon: 'ri:team-line' },
+    meta: { title: '账号管理', icon: 'ri:team-line', roles: ['admin'] },
     children: [
       page('domain', 'DomainAccounts', '域名账号', 'domain-accounts', 'ri:cloud-line'),
       page('ssl', 'SSLAccounts', 'SSL 账号', 'ssl-accounts', 'ri:file-shield-line'),
@@ -23,7 +23,7 @@ export const routeModules: AppRouteRecord[] = [
   page('/logs', 'Logs', '日志管理', 'logs', 'ri:file-list-3-line'),
   {
     path: '/settings', name: 'Settings', component: '/index/index', redirect: '/settings/base',
-    meta: { title: '系统设置', icon: 'ri:settings-3-line' },
+    meta: { title: '系统设置', icon: 'ri:settings-3-line', roles: ['admin'] },
     children: [
       page('base', 'BaseSettings', '基础设置', 'settings', 'ri:settings-line'),
       page('profile', 'Users', '后台用户', 'users', 'ri:user-settings-line'),
