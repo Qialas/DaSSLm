@@ -276,11 +276,11 @@
     certificateStatusTag,
     copyText,
     daysUntil,
+    deployTargetTypeText,
     formatDateTime,
     parseSANs,
     sslProviderNames,
     statusTag,
-    tencentDeployProductNames,
     terminalCertificateStatuses,
     toMap,
     useResponsiveSize,
@@ -627,9 +627,8 @@
       .map((target) => {
         const account = deployAccountMap.value[target.deployAccountId]
         const name = account ? account.name : `账号#${target.deployAccountId}`
-        const product =
-          account?.provider === 'tencentcloud' ? ` / ${tencentDeployProductNames[target.productType || 'ssl'] || target.productType}` : ''
-        return `${name}${product} / ${target.siteName}`
+        const type = deployTargetTypeText(account?.provider, target)
+        return `${name}${type ? ` / ${type}` : ''} / ${target.siteName}`
       })
       .join('；')
   }

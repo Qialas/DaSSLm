@@ -183,7 +183,30 @@ func DeployCertificate(ctx context.Context, account model.DeployAccount, client 
 	return DeployCertificateToTarget(ctx, account, client, Target{SiteName: siteName}, certPEM, keyPEM)
 }
 
+// Result 部署结果。ResourceID 与部署目标中保存的不同时（例如雨云新建证书后拿到的证书ID），
+// 调用方应把 ResourceID/ResourceName 回写到部署目标，下次部署直接更新这个资源。
+type Result struct {
+	ResourceID   string
+	ResourceName string
+	// Message 部署成功时的说明，为空时调用方使用默认文案
+	Message string
+}
+
 func DeployCertificateToTarget(ctx context.Context, account model.DeployAccount, client *http.Client, target Target, certPEM, keyPEM string) (*Trace, error) {
+	trace, _, err := DeployCertificateWithResult(ctx, account, client, target, certPEM, keyPEM)
+	return trace, err
+}
+
+// DeployCertificateWithResult 部署证书并返回需要回写到部署目标的信息。
+func DeployCertificateWithResult(ctx context.Context, account model.DeployAccount, client *http.Client, target Target, certPEM, keyPEM string) (*Trace, Result, error) {
+	if IsRainyunProvider(account.Provider) {
+		return deployRainyunCertificate(ctx, account, client, target, certPEM, keyPEM)
+	}
+	trace, err := deployBTPanelOrTencentCertificate(ctx, account, client, target, certPEM, keyPEM)
+	return trace, Result{}, err
+}
+
+func deployBTPanelOrTencentCertificate(ctx context.Context, account model.DeployAccount, client *http.Client, target Target, certPEM, keyPEM string) (*Trace, error) {
 	if IsTencentCloudProvider(account.Provider) {
 		certificateID, trace, err := uploadTencentCertificate(ctx, account, client, targetLabel(target), certPEM, keyPEM)
 		if err != nil {

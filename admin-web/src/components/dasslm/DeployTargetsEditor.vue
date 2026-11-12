@@ -115,6 +115,51 @@
           </template>
         </template>
 
+        <template v-if="isRainyun">
+          <div class="targets-picker__label">部署方式</div>
+          <ElRadioGroup v-model="draft.ryMode" aria-label="雨云部署方式">
+            <ElRadioButton value="existing">更新已有证书</ElRadioButton>
+            <ElRadioButton value="new">新建证书</ElRadioButton>
+          </ElRadioGroup>
+          <template v-if="draft.ryMode === 'existing'">
+            <div class="targets-picker__label">雨云证书</div>
+            <ElSelect
+              v-model="draft.ryCertId"
+              class="w-full"
+              filterable
+              remote
+              :remote-method="searchRainyunCerts"
+              :loading="ryLoading"
+              placeholder="选择雨云「我的证书」中的一张，可按域名或证书ID搜索"
+              :no-data-text="ryLoading ? '加载中…' : '雨云中没有找到证书'"
+              @visible-change="onRainyunDropdown"
+              @change="onRainyunCertChange"
+            >
+              <ElOption v-for="cert in rainyunOptions" :key="cert.id" :label="rainyunCertLabel(cert)" :value="cert.id">
+                <span class="targets-picker__site">{{ rainyunCertLabel(cert) }}</span>
+                <span class="targets-picker__site-remark">
+                  <template v-if="rainyunCertMatches(cert)">域名匹配 · </template>
+                  {{ cert.expired ? '已过期' : cert.expireAt ? `到期 ${formatDateTime(cert.expireAt).slice(0, 10)}` : '' }}
+                </span>
+              </ElOption>
+            </ElSelect>
+            <div v-if="rainyunMismatch" class="targets-picker__warning">
+              所选证书的域名中没有 {{ defaultSiteName }}，部署后这张雨云证书会被替换成 {{ defaultSiteName }} 的证书，请确认。
+            </div>
+            <div class="targets-picker__hint">
+              每次部署都会替换这张证书的内容，证书 ID 不变，已绑定这张证书的雨云产品会继续使用它。
+            </div>
+          </template>
+          <template v-else>
+            <div class="targets-picker__hint">
+              首次部署时把证书上传到雨云「我的证书」，并记住新证书的 ID；之后证书续期都会更新这张证书，不会重复新建。
+            </div>
+            <div v-if="rainyunMatchedCount" class="targets-picker__hint">
+              雨云中已有 {{ rainyunMatchedCount }} 张 {{ defaultSiteName }} 的证书，如需让已绑定它的产品自动更新，请选择「更新已有证书」。
+            </div>
+          </template>
+        </template>
+
         <template v-if="showSiteSelect">
         <div class="targets-picker__label">
           {{ siteLabel }}
@@ -163,16 +208,19 @@
 
 <script setup lang="ts">
   import { ElMessage } from 'element-plus'
-  import { listDeployAccountSites, type Row } from '@/api/dasslm'
+  import { listDeployAccountCertificates, listDeployAccountSites, type Row } from '@/api/dasslm'
   import DeployAccountPicker from './DeployAccountPicker.vue'
   import ProviderIcon from './ProviderIcon.vue'
   import {
     btDeployTypeNames,
     btDeployTypes,
     deployProviderLabel,
+    formatDateTime,
     isBTPanelProvider,
+    isRainyunProvider,
     normalizeSiteNames,
     normalizeTencentProduct,
+    rainyunTargetText,
     tencentDeployProductNames,
     tencentDeployProducts,
     tencentMultiDomainProducts,
@@ -203,13 +251,16 @@
   const draftAccount = computed(() => (draft.deployAccountId ? accountMap.value[draft.deployAccountId] : undefined))
   const isBTPanel = computed(() => isBTPanelProvider(draftAccount.value?.provider))
   const isTencent = computed(() => draftAccount.value?.provider === 'tencentcloud')
+  const isRainyun = computed(() => isRainyunProvider(draftAccount.value?.provider))
   const isBTDocker = computed(() => isBTPanel.value && draft.btType === 'docker')
   const tencentProductDesc = computed(
     () => tencentDeployProducts.find((item) => item.value === draft.productType)?.desc || ''
   )
   const tencentNeedsRegion = computed(() => tencentRegionProducts.has(draft.productType))
   /** 腾讯云只有 CDN、EdgeOne、WAF 使用多域名输入，其他产品用各自的字段 */
-  const showSiteSelect = computed(() => !isTencent.value || tencentMultiDomainProducts.has(draft.productType))
+  const showSiteSelect = computed(
+    () => !isRainyun.value && (!isTencent.value || tencentMultiDomainProducts.has(draft.productType))
+  )
   const siteLabel = computed(() => {
     if (isTencent.value) return draft.productType === 'cdn' ? '加速域名' : '域名'
     if (isBTDocker.value) return 'Docker 网站域名'
@@ -236,6 +287,8 @@
     Object.assign(draft, { status: 'enabled', siteNames: [], btType: 'site' })
     editingIndex.value = null
     siteOptions.value = []
+    rainyunCerts.value = []
+    rainyunSelected.value = null
   }
 
   function openPicker(target?: Row, index?: number) {
@@ -247,6 +300,7 @@
         btType: target.productType === 'docker' ? 'docker' : 'site'
       })
       if (accountMap.value[target.deployAccountId]?.provider === 'tencentcloud') fillTencentDraft(target)
+      if (isRainyunProvider(accountMap.value[target.deployAccountId]?.provider)) fillRainyunDraft(target)
       editingIndex.value = index ?? null
     } else {
       Object.assign(draft, {
@@ -258,7 +312,10 @@
       })
     }
     pickerOpen.value = true
-    if (draft.deployAccountId) searchSites('')
+    if (draft.deployAccountId) {
+      searchSites('')
+      if (isRainyun.value) searchRainyunCerts('')
+    }
   }
 
   function onAccountChange(_id: number, account: Row) {
@@ -270,6 +327,12 @@
     }
     siteOptions.value = []
     searchSites('')
+    rainyunCerts.value = []
+    rainyunSelected.value = null
+    if (isRainyunProvider(account.provider)) {
+      Object.assign(draft, { ryMode: 'new', ryCertId: undefined })
+      searchRainyunCerts('')
+    }
   }
 
   /** 把已保存的腾讯云实例标识（官方 InstanceIdList 格式）拆回各个输入框 */
@@ -330,6 +393,88 @@
     return '不支持的腾讯云产品'
   }
 
+  // ---------------- 雨云：更新已有证书 / 新建证书 ----------------
+  const rainyunCerts = ref<Row[]>([])
+  /** 当前选中的雨云证书，搜索结果中没有它时也保留在选项里，避免只显示数字 */
+  const rainyunSelected = ref<Row | null>(null)
+  const ryLoading = ref(false)
+  const rainyunOptions = computed(() => {
+    const items = [...rainyunCerts.value]
+    const selected = rainyunSelected.value
+    if (selected && !items.some((item) => Number(item.id) === Number(selected.id))) items.unshift(selected)
+    // 与当前证书域名匹配的排在前面
+    return items.sort((a, b) => Number(rainyunCertMatches(b)) - Number(rainyunCertMatches(a)))
+  })
+  const rainyunMatchedCount = computed(() => rainyunCerts.value.filter((item) => rainyunCertMatches(item) && !item.expired).length)
+  const rainyunMismatch = computed(() => {
+    const selected = rainyunSelected.value
+    if (!props.defaultSiteName || !selected || !rainyunCertDomains(selected).length) return false
+    return !rainyunCertMatches(selected)
+  })
+
+  function rainyunCertDomains(cert: Row): string[] {
+    if (Array.isArray(cert.domains) && cert.domains.length) return cert.domains.map((item: string) => item.toLowerCase())
+    return normalizeSiteNames(String(cert.domain || '').split(/[,，\s]+/)).map((item) => item.toLowerCase())
+  }
+
+  function rainyunCertMatches(cert: Row) {
+    const name = String(props.defaultSiteName || '').trim().toLowerCase()
+    return !!name && rainyunCertDomains(cert).includes(name)
+  }
+
+  function rainyunCertLabel(cert: Row) {
+    return `#${cert.id} ${cert.domain || '（雨云中未找到这张证书）'}`
+  }
+
+  /** 编辑已保存的雨云目标：有证书ID表示更新这张证书（包括首次部署后自动记录的新证书） */
+  function fillRainyunDraft(target: Row) {
+    const id = Number(target.resourceId) || undefined
+    Object.assign(draft, { ryMode: id ? 'existing' : 'new', ryCertId: id })
+    rainyunSelected.value = id ? { id, domain: target.resourceName || '', domains: [] } : null
+  }
+
+  let rainyunSeq = 0
+  async function searchRainyunCerts(keyword: string) {
+    const account = draftAccount.value
+    if (!account || !isRainyunProvider(account.provider)) return
+    const current = ++rainyunSeq
+    ryLoading.value = true
+    try {
+      const res = await listDeployAccountCertificates(account.id, { page: 1, pageSize: 100, keyword: keyword.trim() })
+      if (current !== rainyunSeq) return
+      rainyunCerts.value = res.data.items || []
+      // 用列表中的完整信息替换只有ID的已选证书
+      const selected = rainyunSelected.value
+      const fresh = selected && rainyunCerts.value.find((item) => Number(item.id) === Number(selected.id))
+      if (fresh) rainyunSelected.value = fresh
+    } catch {
+      if (current === rainyunSeq) rainyunCerts.value = []
+    } finally {
+      if (current === rainyunSeq) ryLoading.value = false
+    }
+  }
+
+  function onRainyunDropdown(open: boolean) {
+    if (open) searchRainyunCerts('')
+  }
+
+  function onRainyunCertChange(id: number) {
+    rainyunSelected.value = rainyunOptions.value.find((item) => Number(item.id) === Number(id)) || null
+  }
+
+  function buildRainyunTarget(): Row | string {
+    const base = { productType: '', region: '', extraConfig: '' }
+    if (draft.ryMode !== 'existing') {
+      return { ...base, siteName: props.defaultSiteName || '雨云证书', resourceId: '', resourceName: '' }
+    }
+    const id = Number(draft.ryCertId)
+    if (!id) return '请选择要更新的雨云证书'
+    const selected = rainyunSelected.value && Number(rainyunSelected.value.id) === id ? rainyunSelected.value : null
+    const domain = String(selected?.domain || '').trim()
+    const siteName = rainyunCertDomains(selected || {})[0] || props.defaultSiteName || `雨云证书 ${id}`
+    return { ...base, siteName, resourceId: String(id), resourceName: domain }
+  }
+
   function onBTTypeChange() {
     siteOptions.value = []
     searchSites('')
@@ -378,7 +523,14 @@
       remark: draft.remark || ''
     }
     let nextTargets: Row[]
-    if (isTencent.value) {
+    if (isRainyun.value) {
+      const built = buildRainyunTarget()
+      if (typeof built === 'string') {
+        ElMessage.warning(built)
+        return
+      }
+      nextTargets = [{ ...common, ...built }]
+    } else if (isTencent.value) {
       const built = buildTencentTargets()
       if (typeof built === 'string') {
         ElMessage.warning(built)
@@ -446,6 +598,7 @@
       return tencentDeployProductNames[normalizeTencentProduct(target.productType)] || target.productType
     }
     if (isBTPanelProvider(provider)) return target.productType === 'docker' ? btDeployTypeNames.docker : btDeployTypeNames.site
+    if (isRainyunProvider(provider)) return rainyunTargetText(target)
     return ''
   }
 
@@ -585,6 +738,13 @@
     margin-top: -4px;
     font-size: 12px;
     color: var(--art-gray-500);
+  }
+
+  .targets-picker__warning {
+    margin-top: -4px;
+    font-size: 12px;
+    line-height: 18px;
+    color: var(--el-color-warning);
   }
 
   .targets-picker__help {

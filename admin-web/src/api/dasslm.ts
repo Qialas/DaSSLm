@@ -111,6 +111,9 @@ export const runLogCleanup = (data: { retentionDays: number }) =>
 export const listDeployAccountSites = (id: number, params: Params = {}) =>
   api<ListResult>(`/deploy-accounts/${id}/sites${toQuery(params)}`)
 export const testDeployAccount = (id: number) => api<Row>(`/deploy-accounts/${id}/test`, { method: 'POST' })
+/** 部署服务中已有的证书（目前为雨云「我的证书」），支持 keyword 按域名或证书ID搜索 */
+export const listDeployAccountCertificates = (id: number, params: Params = {}) =>
+  api<ListResult>(`/deploy-accounts/${id}/certificates${toQuery(params)}`)
 
 export const listSSLAccountCertificates = (id: number, params: Params = {}) =>
   api<ListResult>(`/ssl-accounts/${id}/certificates${toQuery(params)}`)

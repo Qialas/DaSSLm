@@ -240,6 +240,18 @@ func (h *AutoTaskHandler) buildAutoDeployTask(req autoTaskRequest, previous *mod
 			}
 			productType, region, resourceID = product, normalizedRegion, instanceID
 		}
+		resourceName := strings.TrimSpace(item.ResourceName)
+		if deployservice.IsRainyunProvider(deployAccount.Provider) {
+			// 雨云：证书ID为空表示首次部署时新建证书，之后回写证书ID并一直更新这张证书
+			certificateID, err := deployservice.NormalizeRainyunCertificateID(resourceID)
+			if err != nil {
+				return model.AutoTask{}, nil, err
+			}
+			productType, region, resourceID = "", "", certificateID
+			if resourceID == "" {
+				resourceName = ""
+			}
+		}
 		key := fmt.Sprintf("%d:%s:%s:%s", deployAccount.ID, productType, firstNonEmpty(resourceID, siteName), siteName)
 		if _, ok := seen[key]; ok {
 			return model.AutoTask{}, nil, fmt.Errorf("部署目标重复：%s", siteName)
@@ -251,7 +263,7 @@ func (h *AutoTaskHandler) buildAutoDeployTask(req autoTaskRequest, previous *mod
 			ProductType:     productType,
 			Region:          region,
 			ResourceID:      resourceID,
-			ResourceName:    strings.TrimSpace(item.ResourceName),
+			ResourceName:    resourceName,
 			ExtraConfig:     strings.TrimSpace(item.ExtraConfig),
 			Status:          core.DefaultString(item.Status, model.StatusEnabled),
 			Remark:          item.Remark,
@@ -386,16 +398,33 @@ func (h *AutoTaskHandler) runAutoDeployTarget(ctx context.Context, task model.Au
 		h.finishAutoTarget(target, "failed", startedAt)
 		return "failed", message
 	}
-	trace, err := deployIssuedCertificateToTarget(ctx, h.db, cert, account, target)
+	trace, result, err := deployIssuedCertificateToTarget(ctx, h.db, cert, account, target)
 	status := "success"
-	message := "自动部署目标执行完成"
+	message := firstNonEmpty(result.Message, "自动部署目标执行完成")
 	if err != nil {
 		status = "failed"
 		message = err.Error()
+	} else {
+		h.saveAutoTargetResource(target, result)
 	}
 	(&CertificateHandler{db: h.db}).logCertificateDeployment(cert, account, firstNonEmpty(target.SiteName, cert.CommonName), status, message, trace)
 	h.finishAutoTarget(target, status, startedAt)
 	return status, message
+}
+
+// saveAutoTargetResource 回写部署后得到的远端资源（例如雨云首次上传后的新证书ID），下次部署直接更新这个资源而不是重复新建。
+func (h *AutoTaskHandler) saveAutoTargetResource(target model.AutoTaskTarget, result deployservice.Result) {
+	resourceID := strings.TrimSpace(result.ResourceID)
+	if resourceID == "" || resourceID == strings.TrimSpace(target.ResourceID) {
+		return
+	}
+	updates := map[string]any{"resource_id": resourceID}
+	if name := strings.TrimSpace(result.ResourceName); name != "" {
+		updates["resource_name"] = name
+	}
+	if err := h.db.Model(&model.AutoTaskTarget{}).Where("id = ?", target.ID).Updates(updates).Error; err != nil {
+		core.LogSystem(h.db, "worker", "auto_task", "error", "auto_ssl_deploy_target", "failed", "回写部署目标资源ID失败", gin.H{"targetId": target.ID, "resourceId": resourceID, "error": err.Error()})
+	}
 }
 
 func (h *AutoTaskHandler) finishAutoTarget(target model.AutoTaskTarget, status string, finishedAt time.Time) {

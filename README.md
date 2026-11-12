@@ -25,7 +25,7 @@ DaSSLm 面向需要统一管理域名解析、SSL 证书申请、证书资产和
 | 管理端 | Art Design Pro、Vue 3、TypeScript、Vite、Element Plus |
 | DNS 接入 | 阿里云DNS、腾讯云DNS、DNSPod、Cloudflare|
 | SSL 接入 | Let's Encrypt、ZeroSSL、LiteSSL、腾讯云免费证书、阿里云免费证书 |
-| 自动部署| 宝塔面板、腾讯云内容网络分发、腾讯云COS|
+| 自动部署| 宝塔面板、腾讯云内容网络分发、腾讯云COS、雨云（SSL 证书中心）|
 
 ## 项目结构
 

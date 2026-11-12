@@ -60,6 +60,44 @@ func (h *DeployAccountHandler) Sites(c *gin.Context) {
 	core.Ok(c, gin.H{"items": items, "total": total, "page": page, "pageSize": pageSize})
 }
 
+// Certificates 列出部署服务中已有的证书，目前用于雨云「我的证书」，部署目标可以选择其中一张进行更新。
+func (h *DeployAccountHandler) Certificates(c *gin.Context) {
+	account, found := h.deployAccount(c)
+	if !found {
+		return
+	}
+	if !deployservice.IsRainyunProvider(account.Provider) {
+		core.Fail(c, http.StatusBadRequest, "当前服务暂不支持证书列表")
+		return
+	}
+	client, err := core.DeployHTTPClient(h.db, account, 30*time.Second)
+	if err != nil {
+		core.Fail(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
+	pageSize, _ := strconv.Atoi(c.DefaultQuery("pageSize", "20"))
+	if page < 1 {
+		page = 1
+	}
+	if pageSize < 1 || pageSize > 100 {
+		pageSize = 20
+	}
+	items, total, trace, err := deployservice.ListRainyunCertificates(c.Request.Context(), account, client, page, pageSize, c.Query("keyword"))
+	status := "success"
+	message := "已获取雨云证书列表"
+	if err != nil {
+		status = "failed"
+		message = err.Error()
+	}
+	h.logDeployAccount("certificates", account, "", status, message, trace)
+	if err != nil {
+		core.Fail(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	core.Ok(c, gin.H{"items": items, "total": total, "page": page, "pageSize": pageSize})
+}
+
 func (h *DeployAccountHandler) Test(c *gin.Context) {
 	account, found := h.deployAccount(c)
 	if !found {
@@ -68,6 +106,17 @@ func (h *DeployAccountHandler) Test(c *gin.Context) {
 	client, err := core.DeployHTTPClient(h.db, account, 30*time.Second)
 	if err != nil {
 		core.Fail(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	if deployservice.IsRainyunProvider(account.Provider) {
+		total, trace, err := deployservice.TestRainyun(c.Request.Context(), account, client)
+		if err != nil {
+			h.logDeployAccount("test", account, "", "failed", err.Error(), trace)
+			core.Fail(c, http.StatusBadRequest, "检测失败："+err.Error())
+			return
+		}
+		h.logDeployAccount("test", account, "", "success", "雨云账号检测通过", trace)
+		core.Ok(c, gin.H{"message": fmt.Sprintf("检测通过：雨云证书列表可访问，共 %d 张证书", total), "total": total})
 		return
 	}
 	if deployservice.IsTencentCloudProvider(account.Provider) {

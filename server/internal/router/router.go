@@ -61,6 +61,7 @@ func New(cfg *config.Config, db *gorm.DB) *gin.Engine {
 	registerResource(authed, admin, "/deploy-accounts", deployAccountHandler)
 	admin.POST("/deploy-accounts/:id/test", deployAccountHandler.Test)
 	authed.GET("/deploy-accounts/:id/sites", deployAccountHandler.Sites)
+	authed.GET("/deploy-accounts/:id/certificates", deployAccountHandler.Certificates)
 	domainHandler := domainhandler.NewDomainHandler(db)
 	registerResource(authed, authed, "/domains", domainHandler)
 	authed.GET("/domain-accounts/:id/provider-domains", domainHandler.ProviderDomains)

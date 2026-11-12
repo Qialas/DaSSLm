@@ -146,14 +146,7 @@
   import TableAction from '@/components/dasslm/TableAction.vue'
   import { useResourceTable } from '@/components/dasslm/useResourceTable'
   import { useWindowSize } from '@vueuse/core'
-  import {
-    btDeployTypeNames,
-    formatDateTime,
-    isBTPanelProvider,
-    statusTag,
-    tencentDeployProductNames,
-    toMap
-  } from '@/components/dasslm/meta'
+  import { deployTargetTypeText, formatDateTime, statusTag, toMap } from '@/components/dasslm/meta'
 
   defineOptions({ name: 'DaSSLmTasks' })
 
@@ -198,13 +191,8 @@
   function targetLabel(target: Row) {
     const account = deployAccountMap.value[target.deployAccountId]
     const name = account ? account.name : `账号#${target.deployAccountId}`
-    let product = ''
-    if (account?.provider === 'tencentcloud') {
-      product = ` / ${tencentDeployProductNames[target.productType || 'ssl'] || target.productType}`
-    } else if (isBTPanelProvider(account?.provider) && target.productType === 'docker') {
-      product = ` / ${btDeployTypeNames.docker}`
-    }
-    return `${name}${product} / ${target.siteName}`
+    const type = deployTargetTypeText(account?.provider, target)
+    return `${name}${type ? ` / ${type}` : ''} / ${target.siteName}`
   }
 
   function targetSummary(targets?: Row[]) {

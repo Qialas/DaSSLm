@@ -81,6 +81,12 @@ func TestOperatorPermissions(t *testing.T) {
 			t.Errorf("operator %s %s: expected 200, got %d", c[0], c[1], code)
 		}
 	}
+	// 操作员配置部署目标时需要读取部署服务的站点/证书列表（账号不存在时为 404，但不能是 403）
+	for _, path := range []string{"/api/deploy-accounts/1/sites", "/api/deploy-accounts/1/certificates"} {
+		if code := call(operator, http.MethodGet, path); code == http.StatusForbidden {
+			t.Errorf("operator GET %s should be allowed, got 403", path)
+		}
+	}
 	if code := call(admin, http.MethodGet, "/api/users"); code != http.StatusOK {
 		t.Errorf("admin GET /api/users: expected 200, got %d", code)
 	}

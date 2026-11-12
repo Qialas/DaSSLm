@@ -2,13 +2,13 @@
 <template>
   <span class="provider-icon" :class="[`provider-icon--${size}`, { 'is-boxed': boxed }]">
     <img v-if="src" :src="src" :alt="alt" />
-    <ArtSvgIcon v-else-if="icon" :icon="icon" />
+    <ArtSvgIcon v-else-if="iconName" :icon="iconName" />
     <span v-else class="provider-icon__letter">{{ letter }}</span>
   </span>
 </template>
 
 <script setup lang="ts">
-  import { providerImages, providerNames } from './meta'
+  import { providerIcons, providerImages, providerNames } from './meta'
 
   defineOptions({ name: 'ProviderIcon' })
 
@@ -29,6 +29,7 @@
   const props = withDefaults(defineProps<Props>(), { size: 'sm', boxed: false })
 
   const src = computed(() => props.image || (props.provider ? providerImages[props.provider] : ''))
+  const iconName = computed(() => props.icon || (props.provider ? providerIcons[props.provider] : ''))
   const alt = computed(() => (props.provider && providerNames[props.provider]) || props.provider || '')
   const letter = computed(() => props.fallback || props.provider?.slice(0, 2).toUpperCase() || '')
 </script>

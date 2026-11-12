@@ -1,4 +1,4 @@
-<!-- 部署账号：宝塔面板 / 腾讯云 -->
+<!-- 部署账号：宝塔面板 / 腾讯云 / 雨云 -->
 <template>
   <div class="art-full-height">
     <ElCard class="art-table-card" shadow="never">
@@ -25,7 +25,7 @@
           </span>
         </template>
         <template #endpoint="{ row }">
-          <template v-if="row.provider === 'tencentcloud'">默认</template>
+          <template v-if="row.provider === 'tencentcloud' || (isRainyunProvider(row.provider) && !row.endpoint)">默认</template>
           <template v-else>{{ row.endpoint || '-' }}</template>
         </template>
         <template #useProxy="{ row }">
@@ -36,7 +36,7 @@
         </template>
         <template #operation="{ row }">
           <TableAction
-            v-if="['btpanel', 'baota', 'tencentcloud'].includes(row.provider)"
+            v-if="['btpanel', 'baota', 'tencentcloud', 'rainyun'].includes(row.provider)"
             icon="ri:flask-line"
             :loading="testingId === row.id"
             @click="testAccount(row)"
@@ -44,6 +44,7 @@
             检测
           </TableAction>
           <TableAction v-if="isBTPanelProvider(row.provider)" icon="ri:list-unordered" @click="openSites(row)">站点</TableAction>
+          <TableAction v-if="isRainyunProvider(row.provider)" icon="ri:file-shield-2-line" @click="openCertificates(row)">证书</TableAction>
           <TableAction icon="ri:pencil-line" @click="openForm(row)">编辑</TableAction>
           <ElPopconfirm title="确认删除？" @confirm="remove(row)">
             <template #reference>
@@ -64,7 +65,7 @@
           <CardRadio v-model="form.provider" :options="deployProviders" aria-label="部署服务" @change="formRef?.clearValidate()" />
         </ElFormItem>
         <ElFormItem
-          v-if="!isTencent"
+          v-if="!isTencent && !isRainyun"
           label="面板地址"
           prop="endpoint"
           :rules="[{ required: true, message: '请输入宝塔面板地址', trigger: 'blur' }]"
@@ -74,12 +75,13 @@
             <div class="mt-1 text-xs leading-5 text-g-500">已自动忽略宝塔面板 HTTPS 自签名证书校验。</div>
           </div>
         </ElFormItem>
-        <ElFormItem
-          :label="isTencent ? 'SecretId' : 'API密钥'"
-          prop="accessKey"
-          :rules="[{ required: true, message: isTencent ? '请输入腾讯云SecretId' : '请输入宝塔面板API密钥', trigger: 'blur' }]"
-        >
-          <ElInput v-model="form.accessKey" type="password" show-password v-bind="secretInputAttrs" />
+        <ElFormItem :label="accessKeyLabel" prop="accessKey" :rules="[{ required: true, message: accessKeyMessage, trigger: 'blur' }]">
+          <div class="w-full">
+            <ElInput v-model="form.accessKey" type="password" show-password v-bind="secretInputAttrs" />
+            <div v-if="isRainyun" class="mt-1 text-xs leading-5 text-g-500">
+              在雨云控制台「账户设置 → API 密钥」中创建。新版 API 密钥需要授予 SSL 证书的读取、上传和替换权限（sslcenter:read、sslcenter:create、sslcenter:write）。
+            </div>
+          </div>
         </ElFormItem>
         <ElFormItem
           v-if="isTencent"
@@ -103,6 +105,50 @@
         <ElButton @click="formOpen = false">取消</ElButton>
         <ElButton type="primary" :loading="saving" @click="submit">保存</ElButton>
       </template>
+    </ElDrawer>
+
+    <!-- 雨云证书列表 -->
+    <ElDrawer
+      v-model="certificatesOpen"
+      :title="`${certificateAccount?.name || ''} 证书列表`"
+      :size="sitesSize"
+      destroy-on-close
+      @closed="certificateAccount = null"
+    >
+      <div class="mb-3 flex items-center gap-3">
+        <ElInput
+          v-model="certificateKeyword"
+          class="!w-72 max-sm:!w-full"
+          clearable
+          placeholder="按域名或证书ID搜索"
+          @keyup.enter="certificateTableRef?.reload()"
+          @clear="certificateTableRef?.reload()"
+        >
+          <template #prefix><ArtSvgIcon icon="ri:search-line" /></template>
+        </ElInput>
+        <span class="text-xs text-g-500">雨云「SSL 证书 → 我的证书」中的证书，自动部署可以选择其中一张进行更新。</span>
+      </div>
+      <RemoteTable v-if="certificateAccount" ref="certificateTableRef" :fetcher="fetchCertificates" empty-text="雨云中还没有证书">
+        <ElTableColumn prop="id" label="证书ID" width="100" />
+        <ElTableColumn label="域名" min-width="220" show-overflow-tooltip>
+          <template #default="{ row }">{{ row.domain || '-' }}</template>
+        </ElTableColumn>
+        <ElTableColumn label="签发机构" min-width="140" show-overflow-tooltip>
+          <template #default="{ row }">{{ row.issuer || '-' }}</template>
+        </ElTableColumn>
+        <ElTableColumn label="到期时间" width="190">
+          <template #default="{ row }">
+            {{ formatDateTime(row.expireAt) }}
+            <ElTag v-if="row.expired" size="small" type="danger" class="ml-1" disable-transitions>已过期</ElTag>
+          </template>
+        </ElTableColumn>
+        <ElTableColumn label="已绑定" min-width="160" show-overflow-tooltip>
+          <template #default="{ row }">{{ row.bindDomains?.length ? row.bindDomains.join('，') : '-' }}</template>
+        </ElTableColumn>
+        <ElTableColumn label="上传时间" width="170">
+          <template #default="{ row }">{{ formatDateTime(row.uploadAt) }}</template>
+        </ElTableColumn>
+      </RemoteTable>
     </ElDrawer>
 
     <!-- 宝塔站点列表 -->
@@ -140,6 +186,7 @@
   import {
     createResource,
     deleteResource,
+    listDeployAccountCertificates,
     listDeployAccountSites,
     testDeployAccount,
     updateResource,
@@ -155,7 +202,9 @@
     deployProviderLabel,
     deployProviders,
     enabledStatusOptions,
+    formatDateTime,
     isBTPanelProvider,
+    isRainyunProvider,
     proxyTag,
     secretInputAttrs,
     statusTag,
@@ -222,6 +271,12 @@
   const formRef = ref<FormInstance>()
   const form = ref<Row>({})
   const isTencent = computed(() => form.value.provider === 'tencentcloud')
+  const isRainyun = computed(() => isRainyunProvider(form.value.provider))
+  const accessKeyLabel = computed(() => (isTencent.value ? 'SecretId' : isRainyun.value ? 'API 密钥' : 'API密钥'))
+  const accessKeyMessage = computed(() => {
+    if (isTencent.value) return '请输入腾讯云SecretId'
+    return isRainyun.value ? '请输入雨云API密钥' : '请输入宝塔面板API密钥'
+  })
   const rules: FormRules = {
     name: [{ required: true, message: '请输入账号名称', trigger: 'blur' }],
     provider: [{ required: true, message: '请选择部署服务', trigger: 'change' }],
@@ -240,7 +295,7 @@
     try {
       const payload = {
         ...form.value,
-        endpoint: isTencent.value ? '' : String(form.value.endpoint || '').replace(/\/+$/, '')
+        endpoint: isTencent.value || isRainyun.value ? '' : String(form.value.endpoint || '').replace(/\/+$/, '')
       }
       if (current.value?.id) {
         await updateResource(RESOURCE, current.value.id, { ...current.value, ...payload })
@@ -285,6 +340,28 @@
   async function fetchSites(page: number, pageSize: number) {
     if (!siteAccount.value?.id) return { items: [], total: 0 }
     const res = await listDeployAccountSites(siteAccount.value.id, { page, pageSize, type: siteType.value })
+    return res.data
+  }
+
+  // ---------------- 雨云证书 ----------------
+  const certificatesOpen = ref(false)
+  const certificateAccount = ref<Row | null>(null)
+  const certificateKeyword = ref('')
+  const certificateTableRef = ref<InstanceType<typeof RemoteTable>>()
+
+  function openCertificates(row: Row) {
+    certificateKeyword.value = ''
+    certificateAccount.value = row
+    certificatesOpen.value = true
+  }
+
+  async function fetchCertificates(page: number, pageSize: number) {
+    if (!certificateAccount.value?.id) return { items: [], total: 0 }
+    const res = await listDeployAccountCertificates(certificateAccount.value.id, {
+      page,
+      pageSize,
+      keyword: certificateKeyword.value.trim()
+    })
     return res.data
   }
 </script>

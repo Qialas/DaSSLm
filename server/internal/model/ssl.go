@@ -28,9 +28,9 @@ func (SSLAccount) TableName() string {
 type DeployAccount struct {
 	BaseModel
 	Name      string `gorm:"size:128;not null;comment:部署账号名称" json:"name"`
-	Provider  string `gorm:"size:64;not null;comment:部署服务商：btpanel宝塔面板 tencentcloud腾讯云" json:"provider"`
+	Provider  string `gorm:"size:64;not null;comment:部署服务商：btpanel宝塔面板 tencentcloud腾讯云 rainyun雨云" json:"provider"`
 	Endpoint  string `gorm:"size:512;comment:服务地址，如宝塔面板URL；腾讯云可填写默认地域" json:"endpoint"`
-	AccessKey string `gorm:"size:512;comment:部署服务API密钥，如宝塔面板API密钥或腾讯云SecretId" json:"accessKey"`
+	AccessKey string `gorm:"size:512;comment:部署服务API密钥，如宝塔面板API密钥、腾讯云SecretId或雨云API密钥" json:"accessKey"`
 	SecretKey string `gorm:"size:512;comment:部署服务SecretKey，如腾讯云SecretKey" json:"secretKey"`
 	Remark    string `gorm:"size:255;comment:备注信息" json:"remark"`
 	Status    string `gorm:"size:32;not null;default:enabled;comment:账号状态：enabled启用 disabled停用" json:"status"`

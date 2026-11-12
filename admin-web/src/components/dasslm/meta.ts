@@ -63,6 +63,11 @@ export const providerImages: Record<string, string> = {
   baota: btpanelIcon
 }
 
+/** 没有图片的服务商使用 Remix 图标 */
+export const providerIcons: Record<string, string> = {
+  rainyun: 'ri:showers-line'
+}
+
 export const dnsProviders: CardOption[] = [
   { value: 'aliyun', label: '阿里云', desc: 'Alibaba Cloud DNS', image: aliyunIcon },
   { value: 'dnspod', label: 'DNSPod', desc: '腾讯云 DNSPod', image: dnspodIcon },
@@ -119,13 +124,34 @@ export const ACME_PROVIDERS = ['letsencrypt', 'zerossl', 'litessl', 'custom_acme
 
 export const deployProviders: CardOption[] = [
   { value: 'btpanel', label: '宝塔面板', desc: 'BT Panel Website SSL', image: btpanelIcon },
-  { value: 'tencentcloud', label: '腾讯云', desc: 'SSL Certificate Upload', image: tencentcloudIcon }
+  { value: 'tencentcloud', label: '腾讯云', desc: 'SSL Certificate Upload', image: tencentcloudIcon },
+  { value: 'rainyun', label: '雨云', desc: 'SSL 证书中心', icon: providerIcons.rainyun }
 ]
 
 export function deployProviderLabel(provider?: string) {
   if (provider === 'baota' || provider === 'btpanel') return '宝塔面板'
   if (provider === 'tencentcloud') return '腾讯云'
+  if (provider === 'rainyun') return '雨云'
   return provider || '-'
+}
+
+export function isRainyunProvider(provider?: string) {
+  return provider === 'rainyun'
+}
+
+/** 雨云部署目标说明：有证书ID时更新这张证书，没有时首次部署新建证书 */
+export function rainyunTargetText(target: Row) {
+  return target.resourceId ? `更新证书 ID ${target.resourceId}` : '新建证书'
+}
+
+/** 部署目标的产品/方式说明（自动任务卡片、列表等使用），没有时返回空字符串 */
+export function deployTargetTypeText(provider: string | undefined, target: Row) {
+  if (provider === 'tencentcloud') {
+    return tencentDeployProductNames[normalizeTencentProduct(target.productType)] || target.productType || ''
+  }
+  if (isBTPanelProvider(provider)) return target.productType === 'docker' ? btDeployTypeNames.docker : ''
+  if (isRainyunProvider(provider)) return rainyunTargetText(target)
+  return ''
 }
 
 export function isBTPanelProvider(provider?: string) {

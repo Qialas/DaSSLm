@@ -31,7 +31,7 @@ type AutoTaskTarget struct {
 	SiteName        string     `gorm:"size:255;not null;comment:部署目标站点或服务名称" json:"siteName"`
 	ProductType     string     `gorm:"size:64;comment:腾讯云产品类型，如ssl、cdn、eo、clb、waf、apigateway、cos" json:"productType"`
 	Region          string     `gorm:"size:64;comment:腾讯云地域，部分产品需要" json:"region"`
-	ResourceID      string     `gorm:"size:255;comment:腾讯云资源ID或域名" json:"resourceId"`
+	ResourceID      string     `gorm:"size:255;comment:部署资源标识：腾讯云资源ID或域名；雨云为要更新的证书ID，为空时首次部署新建证书并回写" json:"resourceId"`
 	ResourceName    string     `gorm:"size:255;comment:腾讯云资源名称" json:"resourceName"`
 	ExtraConfig     string     `gorm:"type:text;comment:部署目标扩展配置JSON" json:"extraConfig"`
 	LastRunAt       *time.Time `gorm:"comment:最近执行时间" json:"lastRunAt"`

@@ -18,6 +18,8 @@ import (
 type certificateDeployRequest struct {
 	DeployAccountID uint   `json:"deployAccountId" binding:"required"`
 	SiteName        string `json:"siteName"`
+	// ResourceID 部署到的远端资源，例如要更新的雨云证书ID；留空时雨云会新建证书
+	ResourceID string `json:"resourceId"`
 }
 
 func (h *CertificateHandler) Deploy(c *gin.Context) {
@@ -44,9 +46,9 @@ func (h *CertificateHandler) Deploy(c *gin.Context) {
 		return
 	}
 	targetName := firstNonEmpty(req.SiteName, row.CommonName)
-	trace, err := deployIssuedCertificate(c.Request.Context(), h.db, row, account, targetName)
+	trace, result, err := deployIssuedCertificateToTarget(c.Request.Context(), h.db, row, account, model.AutoTaskTarget{SiteName: targetName, ResourceID: req.ResourceID})
 	status := "success"
-	message := "证书已部署到目标服务"
+	message := firstNonEmpty(result.Message, "证书已部署到目标服务")
 	if err != nil {
 		status = "failed"
 		message = err.Error()
@@ -65,29 +67,26 @@ func (h *CertificateHandler) Deploy(c *gin.Context) {
 			"target": targetName,
 		},
 	})
-	core.Ok(c, gin.H{"deployed": true, "targetName": targetName})
+	core.Ok(c, gin.H{"deployed": true, "targetName": targetName, "resourceId": result.ResourceID, "message": message})
 }
 
-func deployIssuedCertificate(ctx context.Context, db *gorm.DB, row model.Certificate, account model.DeployAccount, targetName string) (*deployRequestTrace, error) {
-	return deployIssuedCertificateToTarget(ctx, db, row, account, model.AutoTaskTarget{SiteName: targetName})
-}
-
-func deployIssuedCertificateToTarget(ctx context.Context, db *gorm.DB, row model.Certificate, account model.DeployAccount, target model.AutoTaskTarget) (*deployRequestTrace, error) {
+// deployIssuedCertificateToTarget 部署已签发的证书；返回的 Result 中带有需要回写到部署目标的资源信息（如雨云新建证书的ID）。
+func deployIssuedCertificateToTarget(ctx context.Context, db *gorm.DB, row model.Certificate, account model.DeployAccount, target model.AutoTaskTarget) (*deployRequestTrace, deployservice.Result, error) {
 	if !certificateDeployable(row) {
-		return nil, fmt.Errorf("证书未签发，无法部署")
+		return nil, deployservice.Result{}, fmt.Errorf("证书未签发，无法部署")
 	}
 	certPEM := strings.TrimSpace(row.CertPEM)
 	if chainPEM := strings.TrimSpace(row.ChainPEM); chainPEM != "" {
 		certPEM = strings.TrimSpace(certPEM + "\n" + chainPEM)
 	}
 	if certPEM == "" || strings.TrimSpace(row.KeyPEM) == "" {
-		return nil, fmt.Errorf("证书内容不完整，请先在详情中下载证书内容")
+		return nil, deployservice.Result{}, fmt.Errorf("证书内容不完整，请先在详情中下载证书内容")
 	}
 	client, err := deployHTTPClient(db, account)
 	if err != nil {
-		return nil, err
+		return nil, deployservice.Result{}, err
 	}
-	return deployCertificateToTarget(ctx, account, client, deployservice.Target{
+	return deployservice.DeployCertificateWithResult(ctx, account, client, deployservice.Target{
 		SiteName:     firstNonEmpty(target.SiteName, row.CommonName),
 		ProductType:  target.ProductType,
 		Region:       target.Region,
@@ -95,12 +94,4 @@ func deployIssuedCertificateToTarget(ctx context.Context, db *gorm.DB, row model
 		ResourceName: target.ResourceName,
 		ExtraConfig:  target.ExtraConfig,
 	}, certPEM, row.KeyPEM)
-}
-
-func deployCertificate(ctx context.Context, account model.DeployAccount, client *http.Client, siteName, certPEM, keyPEM string) (*deployRequestTrace, error) {
-	return deployservice.DeployCertificate(ctx, account, client, siteName, certPEM, keyPEM)
-}
-
-func deployCertificateToTarget(ctx context.Context, account model.DeployAccount, client *http.Client, target deployservice.Target, certPEM, keyPEM string) (*deployRequestTrace, error) {
-	return deployservice.DeployCertificateToTarget(ctx, account, client, target, certPEM, keyPEM)
 }
